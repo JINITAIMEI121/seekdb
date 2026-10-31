@@ -32,34 +32,34 @@ namespace sql
 namespace
 {
 
-bool read_json_double(const ObJsonNode *node, double &value)
+bool read_json_double(const ObIJsonBase *node, double &value)
 {
   bool valid = true;
   if (OB_ISNULL(node)) {
     valid = false;
   } else if (node->json_type() == ObJsonNodeType::J_DOUBLE) {
-    value = static_cast<const ObJsonDouble *>(node)->value();
+    value = node->get_double();
   } else if (node->json_type() == ObJsonNodeType::J_INT) {
-    value = static_cast<double>(static_cast<const ObJsonInt *>(node)->value());
+    value = static_cast<double>(node->get_int());
   } else if (node->json_type() == ObJsonNodeType::J_UINT) {
-    value = static_cast<double>(static_cast<const ObJsonUint *>(node)->value());
+    value = static_cast<double>(node->get_uint());
   } else {
     valid = false;
   }
   return valid;
 }
 
-bool read_json_int(const ObJsonNode *node, int64_t &value)
+bool read_json_int(const ObIJsonBase *node, int64_t &value)
 {
   bool valid = true;
   if (OB_ISNULL(node)) {
     valid = false;
   } else if (node->json_type() == ObJsonNodeType::J_INT) {
-    value = static_cast<const ObJsonInt *>(node)->value();
+    value = node->get_int();
   } else if (node->json_type() == ObJsonNodeType::J_UINT) {
-    value = static_cast<int64_t>(static_cast<const ObJsonUint *>(node)->value());
+    value = static_cast<int64_t>(node->get_uint());
   } else if (node->json_type() == ObJsonNodeType::J_DOUBLE) {
-    value = static_cast<int64_t>(static_cast<const ObJsonDouble *>(node)->value());
+    value = static_cast<int64_t>(node->get_double());
   } else {
     valid = false;
   }
