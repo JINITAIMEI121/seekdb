@@ -18,6 +18,7 @@
 
 #include "src/storage/fts/ob_ik_ft_parser.h"
 
+#include "lib/allocator/page_arena.h"
 #include "lib/charset/ob_charset.h"
 #include "lib/ob_errno.h"
 #include "lib/oblog/ob_log_module.h"
@@ -231,6 +232,28 @@ int ObIKFTParserDesc::get_add_word_flag(ObAddWordFlag &flag) const
 int ObIKFTParser::init_dict(const ObFTParserParam &param)
 {
   int ret = OB_SUCCESS;
+  ObIFTDict *shared_main = nullptr;
+  ObIFTDict *shared_quan = nullptr;
+  ObIFTDict *shared_stop = nullptr;
+
+  if (OB_ISNULL(hub_)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_SUCC(ObFTParseData::instance().get_ik_dicts(shared_main, shared_quan, shared_stop))) {
+    dict_main_ = shared_main;
+    dict_quan_ = shared_quan;
+    dict_stop_ = shared_stop;
+    owns_dicts_ = false;
+  } else if (FALSE_IT(ret = OB_SUCCESS)) {
+  } else if (OB_FAIL(init_dict_from_hub())) {
+  } else {
+    owns_dicts_ = true;
+  }
+  return ret;
+}
+
+int ObIKFTParser::init_dict_from_hub()
+{
+  int ret = OB_SUCCESS;
   ObIFTDict *tmp_dict = nullptr;
 
   if (OB_ISNULL(hub_)) {
@@ -366,18 +389,24 @@ void ObIKFTParser::reset()
   cache_quan_.reset();
   cache_stop_.reset();
 
-  if (!OB_ISNULL(dict_main_)) {
-    dict_main_->~ObIFTDict();
-    allocator_.free(dict_main_);
+  if (owns_dicts_) {
+    if (!OB_ISNULL(dict_main_)) {
+      dict_main_->~ObIFTDict();
+      allocator_.free(dict_main_);
+    }
+    if (!OB_ISNULL(dict_quan_)) {
+      dict_quan_->~ObIFTDict();
+      allocator_.free(dict_quan_);
+    }
+    if (!OB_ISNULL(dict_stop_)) {
+      dict_stop_->~ObIFTDict();
+      allocator_.free(dict_stop_);
+    }
   }
-  if (!OB_ISNULL(dict_quan_)) {
-    dict_quan_->~ObIFTDict();
-    allocator_.free(dict_quan_);
-  }
-  if (!OB_ISNULL(dict_stop_)) {
-    dict_stop_->~ObIFTDict();
-    allocator_.free(dict_stop_);
-  }
+  dict_main_ = nullptr;
+  dict_quan_ = nullptr;
+  dict_stop_ = nullptr;
+  owns_dicts_ = false;
 
   is_inited_ = false;
 }
