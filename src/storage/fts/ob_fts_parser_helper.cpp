@@ -22,9 +22,7 @@
 
 #include "common/json_type/ob_json_tree.h"
 #include "share/ob_force_print_log.h"
-#include "storage/fts/dict/ob_ft_cache_container.h"
 #include "storage/fts/dict/ob_ft_dict_hub.h"
-#include "storage/fts/dict/ob_ft_range_dict.h"
 #include "storage/fts/ob_beng_ft_parser.h"
 #include "storage/fts/ob_ik_ft_parser.h"
 #include "storage/fts/ob_ngram2_ft_parser.h"
@@ -225,130 +223,6 @@ int ObFTParseData::init_dict_hub()
   return ret;
 }
 
-namespace {
-ObFTDictDesc make_ik_dict_desc(const char *name, const ObFTDictType type)
-{
-  return ObFTDictDesc(ObString(name), type, ObCharsetType::CHARSET_UTF8MB4,
-                      ObCollationType::CS_TYPE_UTF8MB4_BIN);
-}
-
-int load_or_build_ik_dict_cache(ObFTDictHub *hub, const ObFTDictDesc &desc,
-                                ObFTCacheRangeContainer &container)
-{
-  int ret = OB_SUCCESS;
-  if (OB_FAIL(hub->load_cache(desc, container))) {
-    if (OB_ENTRY_NOT_EXIST == ret) {
-      ret = hub->build_cache(desc, container);
-    }
-  }
-  return ret;
-}
-} // namespace
-
-int ObFTParseData::get_ik_dicts(ObIFTDict *&main_dict,
-                                ObIFTDict *&quan_dict,
-                                ObIFTDict *&stop_dict)
-{
-  int ret = OB_SUCCESS;
-  if (!ik_dict_ready_.load(std::memory_order_acquire)) {
-    lib::ObMutexGuard guard(ik_dict_mutex_);
-    if (!ik_dict_ready_.load(std::memory_order_relaxed)) {
-      if (OB_FAIL(init_ik_dicts())) {
-        LOG_WARN("failed to init shared ik dicts", K(ret));
-      } else {
-        ik_dict_ready_.store(true, std::memory_order_release);
-      }
-    }
-  }
-  if (OB_SUCC(ret)) {
-    if (OB_ISNULL(ik_main_dict_) || OB_ISNULL(ik_quan_dict_) || OB_ISNULL(ik_stop_dict_)) {
-      ret = OB_NOT_INIT;
-    } else {
-      main_dict = ik_main_dict_;
-      quan_dict = ik_quan_dict_;
-      stop_dict = ik_stop_dict_;
-    }
-  }
-  return ret;
-}
-
-int ObFTParseData::init_ik_dicts()
-{
-  int ret = OB_SUCCESS;
-  ObFTDictDesc main_desc = make_ik_dict_desc("main_dict", ObFTDictType::DICT_IK_MAIN);
-  ObFTDictDesc quan_desc = make_ik_dict_desc("quan_dict", ObFTDictType::DICT_IK_QUAN);
-  ObFTDictDesc stop_desc = make_ik_dict_desc("stopword", ObFTDictType::DICT_IK_STOP);
-
-  if (OB_ISNULL(dict_hub_)) {
-    ret = OB_NOT_INIT;
-  } else if (OB_ISNULL(ik_main_container_ = OB_NEWx(ObFTCacheRangeContainer, &handler_allocator_,
-                                                   handler_allocator_))) {
-    ret = OB_ALLOCATE_MEMORY_FAILED;
-  } else if (OB_FAIL(load_or_build_ik_dict_cache(dict_hub_, main_desc, *ik_main_container_))) {
-  } else if (OB_ISNULL(ik_main_dict_ = OB_NEWx(ObFTRangeDict, &handler_allocator_, handler_allocator_,
-                                               ik_main_container_, main_desc))) {
-    ret = OB_ALLOCATE_MEMORY_FAILED;
-  } else if (OB_FAIL(ik_main_dict_->init())) {
-  } else if (OB_ISNULL(ik_quan_container_ = OB_NEWx(ObFTCacheRangeContainer, &handler_allocator_,
-                                                    handler_allocator_))) {
-    ret = OB_ALLOCATE_MEMORY_FAILED;
-  } else if (OB_FAIL(load_or_build_ik_dict_cache(dict_hub_, quan_desc, *ik_quan_container_))) {
-  } else if (OB_ISNULL(ik_quan_dict_ = OB_NEWx(ObFTRangeDict, &handler_allocator_, handler_allocator_,
-                                               ik_quan_container_, quan_desc))) {
-    ret = OB_ALLOCATE_MEMORY_FAILED;
-  } else if (OB_FAIL(ik_quan_dict_->init())) {
-  } else if (OB_ISNULL(ik_stop_container_ = OB_NEWx(ObFTCacheRangeContainer, &handler_allocator_,
-                                                    handler_allocator_))) {
-    ret = OB_ALLOCATE_MEMORY_FAILED;
-  } else if (OB_FAIL(load_or_build_ik_dict_cache(dict_hub_, stop_desc, *ik_stop_container_))) {
-  } else if (OB_ISNULL(ik_stop_dict_ = OB_NEWx(ObFTRangeDict, &handler_allocator_, handler_allocator_,
-                                               ik_stop_container_, stop_desc))) {
-    ret = OB_ALLOCATE_MEMORY_FAILED;
-  } else if (OB_FAIL(ik_stop_dict_->init())) {
-  }
-
-  if (OB_FAIL(ret)) {
-    LOG_WARN("failed to build shared ik dicts", K(ret));
-    destroy_ik_dicts();
-  }
-  return ret;
-}
-
-void ObFTParseData::destroy_ik_dicts()
-{
-  if (OB_NOT_NULL(ik_main_dict_)) {
-    ik_main_dict_->~ObIFTDict();
-    handler_allocator_.free(ik_main_dict_);
-    ik_main_dict_ = nullptr;
-  }
-  if (OB_NOT_NULL(ik_quan_dict_)) {
-    ik_quan_dict_->~ObIFTDict();
-    handler_allocator_.free(ik_quan_dict_);
-    ik_quan_dict_ = nullptr;
-  }
-  if (OB_NOT_NULL(ik_stop_dict_)) {
-    ik_stop_dict_->~ObIFTDict();
-    handler_allocator_.free(ik_stop_dict_);
-    ik_stop_dict_ = nullptr;
-  }
-  if (OB_NOT_NULL(ik_main_container_)) {
-    ik_main_container_->~ObFTCacheRangeContainer();
-    handler_allocator_.free(ik_main_container_);
-    ik_main_container_ = nullptr;
-  }
-  if (OB_NOT_NULL(ik_quan_container_)) {
-    ik_quan_container_->~ObFTCacheRangeContainer();
-    handler_allocator_.free(ik_quan_container_);
-    ik_quan_container_ = nullptr;
-  }
-  if (OB_NOT_NULL(ik_stop_container_)) {
-    ik_stop_container_->~ObFTCacheRangeContainer();
-    handler_allocator_.free(ik_stop_container_);
-    ik_stop_container_ = nullptr;
-  }
-  ik_dict_ready_.store(false, std::memory_order_release);
-}
-
 void ObFTParseData::destroy()
 {
   if (OB_NOT_NULL(stop_word_checker_)) {
@@ -364,7 +238,6 @@ void ObFTParseData::destroy()
     dict_hub_ = nullptr;
   }
 
-  destroy_ik_dicts();
   handler_allocator_.reset();
   is_inited_ = false;
 }
