@@ -422,7 +422,7 @@ END_P SET_VAR DELIMITER
 %type <node> opt_float_precision opt_number_precision
 %type <node> opt_equal_mark opt_default_mark read_only_or_write not not2
 %type <node> int_or_decimal
-%type <node> opt_column_attribute_list column_attribute column_attribute_list opt_column_default_value opt_column_default_value_list
+%type <node> opt_column_attribute_list column_attribute column_attribute_list opt_ai_column_options ai_column_option_list ai_column_option opt_column_default_value opt_column_default_value_list
 %type <node> show_stmt from_or_in columns_or_fields database_or_schema index_or_indexes_or_keys opt_from_or_in_database_clause opt_show_condition opt_desc_column_option opt_status opt_storage opt_show_engine check_table_options check_table_option
 %type <node> prepare_stmt stmt_name preparable_stmt
 %type <node> variable_set_stmt var_and_val_list var_and_val to_or_eq set_expr_or_default sys_var_and_val
@@ -6206,6 +6206,14 @@ not NULLX
   ParseNode *opt_skip_index_type_list = NULL;
   merge_nodes(opt_skip_index_type_list, result, T_COL_SKIP_INDEX_LIST, $3);
   malloc_non_terminal_node($$, result->malloc_pool_, T_COL_SKIP_INDEX, 1, opt_skip_index_type_list);
+}
+| AI COLUMN '(' expr ')' opt_ai_column_options
+{
+  /* AI COLUMN ( <expr> ) WITH (key = value, ...) -- a column whose value is
+     produced by an AI model. The expression is kept as a normal expr node so the
+     DDL resolver can resolve it against the table being created. */
+  dup_expr_string($4, result, @4.first_column, @4.last_column);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_AI_COLUMN_EXPR, 2, $4, $6);
 }
 | lob_chunk_size
 {
@@ -12259,6 +12267,50 @@ TO explainable_stmt
 $$ = NULL;
 };
 
+
+
+opt_ai_column_options:
+/*EMPTY*/
+{
+  $$ = NULL;
+}
+| WITH '(' ai_column_option_list ')'
+{
+  ParseNode *opt_list = NULL;
+  merge_nodes(opt_list, result, T_AI_COLUMN_OPTIONS, $3);
+  $$ = opt_list;
+}
+;
+
+ai_column_option_list:
+ai_column_option
+{
+  $$ = $1;
+}
+| ai_column_option_list ',' ai_column_option
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3);
+}
+;
+
+ai_column_option:
+NAME_OB COMP_EQ expr
+{
+  ParseNode *name_node = NULL;
+  malloc_terminal_node(name_node, result->malloc_pool_, T_VARCHAR);
+  name_node->str_value_ = $1->str_value_;
+  name_node->str_len_ = $1->str_len_;
+  malloc_non_terminal_node($$, result->malloc_pool_, T_AI_COLUMN_OPTION, 2, name_node, $3);
+}
+| NAME_OB
+{
+  ParseNode *name_node = NULL;
+  malloc_terminal_node(name_node, result->malloc_pool_, T_VARCHAR);
+  name_node->str_value_ = $1->str_value_;
+  name_node->str_len_ = $1->str_len_;
+  malloc_non_terminal_node($$, result->malloc_pool_, T_AI_COLUMN_OPTION, 2, name_node, NULL);
+}
+;
 
 /*****************************************************************************
  *

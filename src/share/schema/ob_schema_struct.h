@@ -142,6 +142,8 @@ static const uint64_t OB_MIN_ID  = 0;//used for lower_bound
 #define GENERATED_VEC_SCN_COLUMN_FLAG (INT64_C(1) << 41)
 #define GENERATED_VEC_KEY_COLUMN_FLAG (INT64_C(1) << 42)
 #define GENERATED_VEC_DATA_COLUMN_FLAG (INT64_C(1) << 43)
+#define AI_COLUMN_RESULT_COLUMN_FLAG (INT64_C(1) << 44) // visible column produced by an AI model
+#define AI_COLUMN_COMPANION_COLUMN_FLAG (INT64_C(1) << 45) // hidden state/request/result-spec column
 #define GENERATED_VEC_IVF_CENTER_VECTOR_COLUMN_FLAG (INT64_C(1) << 44)
 #define GENERATED_VEC_IVF_DATA_VECTOR_COLUMN_FLAG (INT64_C(1) << 45)
 #define GENERATED_VEC_IVF_META_ID_COLUMN_FLAG (INT64_C(1) << 46)

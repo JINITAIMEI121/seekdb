@@ -106,6 +106,36 @@ int ObCreateTableResolver::add_primary_key_part(const ObString &column_name,
   return ret;
 }
 
+int ObCreateTableResolver::add_ai_column_companions(share::schema::ObTableSchema &table_schema)
+{
+  INIT_SUCC(ret);
+  ObIArray<AiColumnSpec> &specs = get_ai_column_specs();
+  for (int64_t i = 0; OB_SUCC(ret) && i < specs.count(); ++i) {
+    const AiColumnSpec &spec = specs.at(i);
+    const ObColumnSchemaV2 *result = table_schema.get_column_schema(spec.column_id_);
+    ObString comment;
+    bool is_json_result = false;
+    if (OB_ISNULL(result)) {
+      ret = OB_ERR_UNEXPECTED;
+      SQL_RESV_LOG(WARN, "ai column result column is missing", K(ret), K(spec));
+    } else if (FALSE_IT(is_json_result = (ObJsonType == result->get_data_type()))) {
+    } else if (OB_FAIL(build_ai_column_spec_comment(*allocator_, spec, is_json_result, comment))) {
+      SQL_RESV_LOG(WARN, "fail to build ai column spec comment", K(ret), K(spec));
+    }
+    for (int64_t k = 0; OB_SUCC(ret) && k < 3; ++k) {
+      ObColumnSchemaV2 hidden;
+      ObString name;
+      hidden.set_column_id(table_schema.get_max_used_column_id() + 1);
+      if (OB_FAIL(build_ai_companion_name(*allocator_, spec.column_name_, k, name))) {
+      } else if (OB_FAIL(build_ai_companion_column(name, k, comment, hidden))) {
+      } else if (OB_FAIL(table_schema.add_column(hidden))) {
+        SQL_RESV_LOG(WARN, "fail to add companion column", K(ret), K(name));
+      }
+    }
+  }
+  return ret;
+}
+
 int ObCreateTableResolver::add_hidden_tablet_seq_col()
 {
   int ret = OB_SUCCESS;
@@ -936,6 +966,11 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
         if (0 != autoinc_column_id) {
           table_schema.set_autoinc_column_id(autoinc_column_id);
         }
+      }
+    }
+    if (OB_SUCC(ret) && !get_ai_column_specs().empty()) {
+      if (OB_FAIL(add_ai_column_companions(table_schema))) {
+        SQL_RESV_LOG(WARN, "fail to add ai column companion columns", K(ret));
       }
     }
 

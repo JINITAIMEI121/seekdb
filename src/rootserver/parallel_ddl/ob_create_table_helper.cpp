@@ -15,6 +15,7 @@
  */
 
 #define USING_LOG_PREFIX RS
+#include "rootserver/ob_ddl_service.h"            // write_ai_column_rows
 #include "rootserver/parallel_ddl/ob_create_table_helper.h"
 #include "rootserver/ob_index_builder.h"
 #include "rootserver/ob_lob_meta_builder.h"
@@ -878,6 +879,9 @@ int ObCreateTableHelper::clean_on_fail_commit_()
 int ObCreateTableHelper::operation_before_commit_() {
   int ret = OB_SUCCESS;
   if (OB_FAIL(check_inner_stat_())) {
+  } else if (OB_FAIL(write_ai_column_rows(get_trans_(), new_tables_.at(0).get_table_id(),
+                                          arg_.schema_, arg_.schema_))) {
+    SERVER_LOG(WARN, "fail to write ai column rows", K(ret));
   }
   return ret;
 }

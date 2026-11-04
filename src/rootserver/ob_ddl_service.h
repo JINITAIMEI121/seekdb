@@ -2215,6 +2215,14 @@ int ObDDLService::check_partition_name_valid(const SCHEMA &orig_schema,
   return ret;
 }
 
+// AI columns own three hidden companion columns; CREATE TABLE and ALTER TABLE ADD
+// COLUMN stamp their spec into the request column's comment. Materialise the
+// __all_ai_column row for every such column that @added_columns contributes.
+int write_ai_column_rows(common::ObMySQLTransaction &trans,
+                         const uint64_t table_id,
+                         const share::schema::ObTableSchema &table_schema,
+                         const share::schema::ObTableSchema &added_columns);
+
 } // end namespace rootserver
 } // end namespace oceanbasr
 #endif // _OCEANBASE_ROOTSERVER_OB_DDL_SERVICE_H_

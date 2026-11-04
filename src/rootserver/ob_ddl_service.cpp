@@ -26,6 +26,7 @@
 #include "rootserver/ob_runtime_ddl_service.h"
 #include "query/session/ob_inner_sql_connection_access.h"
 #include "share/ob_ddl_common.h"
+#include "share/ob_dml_sql_splicer.h"
 #include "share/inner_table/ob_inner_table_schema_constants.h"
 #include "sql/printer/ob_schema_printer.h"
 #include "share/autoincrement/ob_i_tablet_autoincrement_admin.h"
@@ -8229,6 +8230,167 @@ int ObDDLService::update_prev_id_and_add_column_(
   return ret;
 }
 
+namespace
+{
+const char *AI_COLUMN_SPEC_PREFIX = "ai_column|";
+const char *AI_COLUMN_STATE_PREFIX = "__ai_state_";
+const char *AI_COLUMN_REQUEST_PREFIX = "__ai_request_";
+const char *AI_COLUMN_SPEC_COL_PREFIX = "__ai_result_spec_";
+const char *AI_COLUMN_EXPR_KEY = "normalized_expr=";
+
+struct AiColumnSpecText
+{
+  AiColumnSpecText() : max_retries_(0), model_(), sync_mode_(), normalized_expr_() {}
+  TO_STRING_KV(K_(max_retries), K_(model), K_(sync_mode), K_(normalized_expr));
+  int64_t max_retries_;
+  ObString model_;
+  ObString sync_mode_;
+  ObString normalized_expr_;
+};
+
+// The resolver stamps the spec into the hidden request column's comment as
+// "ai_column|model=..|sync_mode=..|max_retries=..|normalized_expr=..".
+// normalized_expr comes last because an expression may itself contain '=' and '|'.
+int parse_ai_column_spec(const ObString &body, ObIAllocator &alloc, AiColumnSpecText &spec)
+{
+  INIT_SUCC(ret);
+  static const int64_t KEY_VALUE_FIELDS = 3;
+  int64_t start = 0;
+  for (int64_t i = 0; OB_SUCC(ret) && i < KEY_VALUE_FIELDS && start < body.length(); ++i) {
+    int64_t pos = start;
+    while (pos < body.length() && '|' != body.ptr()[pos]) { ++pos; }
+    const ObString field(static_cast<int32_t>(pos - start), body.ptr() + start);
+    const char *eq = static_cast<const char *>(memchr(field.ptr(), '=', field.length()));
+    if (OB_NOT_NULL(eq)) {
+      const ObString key(static_cast<int32_t>(eq - field.ptr()), field.ptr());
+      const int32_t vlen = static_cast<int32_t>(field.length() - (eq - field.ptr()) - 1);
+      char *vbuf = NULL;
+      if (vlen < 0) {
+        ret = OB_INVALID_ARGUMENT;
+      } else if (OB_ISNULL(vbuf = static_cast<char *>(alloc.alloc(vlen + 1)))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else {
+        MEMCPY(vbuf, eq + 1, vlen);
+        vbuf[vlen] = '\0';
+        const ObString value(vlen, vbuf);
+        if (0 == key.case_compare("model")) {
+          spec.model_ = value;
+        } else if (0 == key.case_compare("sync_mode")) {
+          spec.sync_mode_ = value;
+        } else if (0 == key.case_compare("max_retries")) {
+          spec.max_retries_ = strtoll(value.ptr(), NULL, 10);
+        }
+      }
+    }
+    start = pos + 1;
+  }
+  if (OB_SUCC(ret) && start <= body.length()) {
+    const int64_t key_len = strlen(AI_COLUMN_EXPR_KEY);
+    const ObString expr(static_cast<int32_t>(body.length() - start), body.ptr() + start);
+    if (expr.length() > key_len && expr.prefix_match(AI_COLUMN_EXPR_KEY)) {
+      spec.normalized_expr_ = ObString(static_cast<int32_t>(expr.length() - key_len),
+                                       expr.ptr() + key_len);
+    } else {
+      spec.normalized_expr_ = expr;
+    }
+  }
+  return ret;
+}
+
+int write_one_ai_column_row(ObMySQLTransaction &trans,
+                            const uint64_t table_id,
+                            const ObTableSchema &table_schema,
+                            const ObColumnSchemaV2 &request_col)
+{
+  INIT_SUCC(ret);
+  const int64_t prefix_len = strlen(AI_COLUMN_REQUEST_PREFIX);
+  const ObString &request_name = request_col.get_column_name_str();
+  const int32_t base_len = static_cast<int32_t>(request_name.length() - prefix_len);
+  char state_buf[512] = {0};
+  char spec_buf[512] = {0};
+  int64_t state_pos = 0;
+  int64_t spec_pos = 0;
+  ObArenaAllocator alloc("AiColSpec");
+  AiColumnSpecText spec;
+  ObSqlString buffer;
+  ObDMLSqlSplicer splicer;
+  int64_t affected_rows = 0;
+  const ObString base(base_len, request_name.ptr() + prefix_len);
+  const ObString &comment = request_col.get_comment_str();
+  if (base_len <= 0
+      || comment.length() <= static_cast<int64_t>(strlen(AI_COLUMN_SPEC_PREFIX))) {
+    ret = OB_ERR_UNEXPECTED;
+    RS_LOG(WARN, "ai column companion name or spec is truncated", K(ret), K(request_name));
+  } else if (OB_FAIL(databuff_printf(state_buf, sizeof(state_buf), state_pos, "%s%.*s",
+                                    AI_COLUMN_STATE_PREFIX, base.length(), base.ptr()))) {
+    RS_LOG(WARN, "fail to build state column name", K(ret), K(base));
+  } else if (OB_FAIL(databuff_printf(spec_buf, sizeof(spec_buf), spec_pos, "%s%.*s",
+                                    AI_COLUMN_SPEC_COL_PREFIX, base.length(), base.ptr()))) {
+    RS_LOG(WARN, "fail to build result spec column name", K(ret), K(base));
+  } else {
+    const ObString state_name(static_cast<int32_t>(state_pos), state_buf);
+    const ObString spec_name(static_cast<int32_t>(spec_pos), spec_buf);
+    const ObColumnSchemaV2 *result = table_schema.get_column_schema(base);
+    const ObColumnSchemaV2 *state = table_schema.get_column_schema(state_name);
+    const ObColumnSchemaV2 *result_spec = table_schema.get_column_schema(spec_name);
+    const ObString body(static_cast<int32_t>(comment.length() - strlen(AI_COLUMN_SPEC_PREFIX)),
+                        comment.ptr() + strlen(AI_COLUMN_SPEC_PREFIX));
+    if (OB_ISNULL(result) || OB_ISNULL(state) || OB_ISNULL(result_spec)) {
+      ret = OB_ERR_UNEXPECTED;
+      RS_LOG(WARN, "ai column companion columns are missing", K(ret), K(base),
+             KP(result), KP(state), KP(result_spec));
+    } else if (OB_FAIL(parse_ai_column_spec(body, alloc, spec))) {
+      RS_LOG(WARN, "fail to parse ai column spec", K(ret), K(comment));
+    } else if (OB_FAIL(splicer.add_pk_column("table_id", table_id))) {
+    } else if (OB_FAIL(splicer.add_pk_column("column_id", result->get_column_id()))) {
+    } else if (OB_FAIL(splicer.add_column("column_name",
+                                          ObHexEscapeSqlStr(result->get_column_name_str())))) {
+    } else if (OB_FAIL(splicer.add_column("ai_model_name", ObHexEscapeSqlStr(spec.model_)))) {
+    } else if (OB_FAIL(splicer.add_column("sync_mode", ObHexEscapeSqlStr(spec.sync_mode_)))) {
+    } else if (OB_FAIL(splicer.add_column("max_retries", spec.max_retries_))) {
+    } else if (OB_FAIL(splicer.add_column("state_column_id", state->get_column_id()))) {
+    } else if (OB_FAIL(splicer.add_column("request_column_id", request_col.get_column_id()))) {
+    } else if (OB_FAIL(splicer.add_column("result_spec_column_id",
+                                          result_spec->get_column_id()))) {
+    } else if (OB_FAIL(splicer.add_column("normalized_expr",
+                                          ObHexEscapeSqlStr(spec.normalized_expr_)))) {
+    } else if (OB_FAIL(splicer.add_column("status", ObHexEscapeSqlStr(ObString(7, "PENDING"))))) {
+    } else if (OB_FAIL(splicer.splice_insert_sql(OB_ALL_AI_COLUMN_TNAME, buffer))) {
+      RS_LOG(WARN, "fail to splice ai column insert", K(ret));
+    } else if (OB_FAIL(trans.write(buffer.ptr(), affected_rows))) {
+      RS_LOG(WARN, "fail to write ai column row", K(ret), K(buffer));
+    } else if (!is_single_row(affected_rows)) {
+      ret = OB_ERR_UNEXPECTED;
+      RS_LOG(WARN, "unexpected affected rows", K(ret), K(affected_rows));
+    }
+  }
+  return ret;
+}
+} // namespace
+
+// Materialise one __all_ai_column row per AI column contributed by @added_columns.
+// The companion column ids are resolved by name against @table_schema, which holds
+// the schema after this DDL, so CREATE TABLE and ALTER TABLE share one code path.
+int write_ai_column_rows(ObMySQLTransaction &trans,
+                         const uint64_t table_id,
+                         const ObTableSchema &table_schema,
+                         const ObTableSchema &added_columns)
+{
+  INIT_SUCC(ret);
+  const int64_t column_count = added_columns.get_column_count();
+  for (int64_t i = 0; OB_SUCC(ret) && i < column_count; ++i) {
+    const ObColumnSchemaV2 *col = added_columns.get_column_schema_by_idx(i);
+    if (OB_ISNULL(col) || !col->is_hidden()
+        || !col->get_column_name_str().prefix_match(AI_COLUMN_REQUEST_PREFIX)
+        || !col->get_comment_str().prefix_match(AI_COLUMN_SPEC_PREFIX)) {
+      // not an ai column request companion
+    } else if (OB_FAIL(write_one_ai_column_row(trans, table_id, table_schema, *col))) {
+      RS_LOG(WARN, "fail to write ai column row", K(ret), K(i));
+    }
+  }
+  return ret;
+}
+
 int ObDDLService::alter_table_column(const ObTableSchema &origin_table_schema,
                                      const AlterTableSchema &alter_table_schema,
                                      ObTableSchema &new_table_schema,
@@ -8602,6 +8764,13 @@ int ObDDLService::alter_table_column(const ObTableSchema &origin_table_schema,
       const bool require_strict_binary_format = share::ObDDLUtil::use_idempotent_mode() && !is_all_column_exactly_same_type;
       if (OB_FAIL(ObDDLLock::lock_for_common_ddl_in_trans(new_table_schema, require_strict_binary_format, trans))) {
       }
+    }
+    // Only the columns this statement contributes get a metadata row, so re-running
+    // an unrelated ALTER on a table that already has AI columns cannot duplicate one.
+    if (OB_SUCC(ret)
+        && OB_FAIL(write_ai_column_rows(trans, new_table_schema.get_table_id(),
+                                        new_table_schema, alter_table_schema))) {
+      RS_LOG(WARN, "fail to write ai column rows", K(ret));
     }
   }
 

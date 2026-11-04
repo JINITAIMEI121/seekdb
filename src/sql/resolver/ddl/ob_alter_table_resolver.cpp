@@ -3457,11 +3457,48 @@ int ObAlterTableResolver::resolve_add_column(const ParseNode &node, ObColumnName
         if (OB_SUCC(ret)) {
           if (OB_FAIL(alter_table_stmt->add_column(alter_column_schema))) {
           } else if (FALSE_IT(alter_table_stmt->set_sql_mode(session_info_->get_sql_mode()))) {
+          } else if (OB_FAIL(add_ai_column_companions_for_alter(*alter_table_stmt,
+                                                                 alter_column_schema))) {
+            SQL_RESV_LOG(WARN, "fail to add ai column companion columns", K(ret));
           }
         }
       }
     }
     add_column_cnt_++;
+  }
+  return ret;
+}
+
+int ObAlterTableResolver::add_ai_column_companions_for_alter(
+    ObAlterTableStmt &stmt,
+    const share::schema::AlterColumnSchema &column)
+{
+  INIT_SUCC(ret);
+  const AiColumnSpec *spec = find_ai_column_spec(column.get_column_name_str());
+  if (OB_ISNULL(spec)) {
+    // an ordinary column, nothing to add
+  } else {
+    ObString comment;
+    const bool is_json_result = (ObJsonType == column.get_data_type());
+    if (OB_FAIL(build_ai_column_spec_comment(*allocator_, *spec, is_json_result, comment))) {
+      SQL_RESV_LOG(WARN, "fail to build ai column spec comment", K(ret), KPC(spec));
+    }
+    for (int64_t k = 0; OB_SUCC(ret) && k < 3; ++k) {
+      AlterColumnSchema companion;
+      ObString name;
+      if (OB_FAIL(build_ai_companion_name(*allocator_, spec->column_name_, k, name))) {
+      } else if (OB_FAIL(build_ai_companion_column(name, k, comment, companion))) {
+        SQL_RESV_LOG(WARN, "fail to build ai companion column", K(ret), K(name));
+      } else {
+        companion.alter_type_ = OB_DDL_ADD_COLUMN;
+        companion.is_primary_key_ = false;
+        companion.is_unique_key_ = false;
+        companion.is_autoincrement_ = false;
+        if (OB_FAIL(stmt.add_column(companion))) {
+          SQL_RESV_LOG(WARN, "fail to add ai companion column", K(ret), K(name));
+        }
+      }
+    }
   }
   return ret;
 }

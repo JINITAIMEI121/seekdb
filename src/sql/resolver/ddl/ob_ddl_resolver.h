@@ -109,6 +109,23 @@ struct ObDefaultValueRes
 class ObDDLResolver : public ObStmtResolver
 {
 public:
+  // One entry per `col AI COLUMN ( ... ) WITH ( ... )` in the statement. The
+  // companion hidden columns are allocated after every user column has an id, so
+  // the ids cannot be taken here.
+  struct AiColumnSpec
+  {
+    AiColumnSpec() : column_id_(common::OB_INVALID_ID), column_name_(), model_name_(),
+                     sync_mode_(), expr_text_(), max_retries_(0) {}
+    TO_STRING_KV(K_(column_id), K_(column_name), K_(model_name), K_(sync_mode),
+                 K_(max_retries));
+    uint64_t column_id_;
+    common::ObString column_name_;
+    common::ObString model_name_;
+    common::ObString sync_mode_;
+    common::ObString expr_text_;
+    int64_t max_retries_;
+  };
+  common::ObSEArray<AiColumnSpec, 4> ai_column_specs_;
   enum INDEX_TYPE {
     NOT_SPECIFIED = 0,
     LOCAL_INDEX = 1,
@@ -557,6 +574,34 @@ protected:
   int resolve_lob_storage_parameter(share::schema::ObColumnSchemaV2 &column, const ParseNode &param_node);
   int resolve_lob_chunk_size(const ParseNode &size_node, int64_t &lob_chunk_size);
   int resolve_lob_chunk_size(share::schema::ObColumnSchemaV2 &column, const ParseNode &lob_chunk_size_node);
+  int resolve_ai_column_attribute(share::schema::ObColumnSchemaV2 &column,
+                                  const ParseNode &attr_node);
+  common::ObIArray<AiColumnSpec> &get_ai_column_specs() { return ai_column_specs_; }
+  const AiColumnSpec *find_ai_column_spec(const common::ObString &column_name) const
+  {
+    const AiColumnSpec *found = NULL;
+    for (int64_t i = 0; NULL == found && i < ai_column_specs_.count(); ++i) {
+      if (0 == ai_column_specs_.at(i).column_name_.compare(column_name)) {
+        found = &ai_column_specs_.at(i);
+      }
+    }
+    return found;
+  }
+  // An AI column owns three hidden companions named after it; the spec itself travels
+  // on the request column's comment, where the rootserver turns it into __all_ai_column.
+  static int build_ai_companion_name(common::ObIAllocator &alloc,
+                                     const common::ObString &column_name,
+                                     const int64_t kind,
+                                     common::ObString &name);
+  static int build_ai_column_spec_comment(common::ObIAllocator &alloc,
+                                          const AiColumnSpec &spec,
+                                          const bool is_json_result,
+                                          common::ObString &comment);
+  // kind: 0 = state, 1 = request (carries @comment), 2 = result spec.
+  static int build_ai_companion_column(const common::ObString &name,
+                                       const int64_t kind,
+                                       const common::ObString &comment,
+                                       share::schema::ObColumnSchemaV2 &column);
   int resolve_semistruct_encoding_type(const ParseNode *option_node, const bool is_index_option);
   /*
   int resolve_generated_column_definition(
