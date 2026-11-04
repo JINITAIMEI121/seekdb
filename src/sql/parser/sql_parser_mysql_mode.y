@@ -385,7 +385,7 @@ END_P SET_VAR DELIMITER
 %type <node> subpartition_template_option subpartition_individual_option opt_hash_partition_list hash_partition_list hash_partition_element opt_hash_subpartition_list hash_subpartition_list hash_subpartition_element opt_subpartition_list opt_engine_option
 %type <node> date_unit date_params timestamp_params
 %type <node> drop_table_stmt table_list drop_view_stmt table_or_tables
-%type <node> explain_stmt explainable_stmt format_name kill_stmt create_outline_stmt alter_outline_stmt drop_outline_stmt opt_outline_target
+%type <node> explain_stmt copy_stmt copy_option_list copy_option explainable_stmt format_name kill_stmt create_outline_stmt alter_outline_stmt drop_outline_stmt opt_outline_target
 %type <node> expr_list expr expr_const conf_const simple_expr simple_expr_list expr_or_default bit_expr bool_pri predicate explain_or_desc pl_expr_stmt
 %type <node> column_ref multi_delete_table
 %type <node> case_expr func_expr in_expr sub_query_flag search_expr
@@ -512,7 +512,7 @@ END_P SET_VAR DELIMITER
 %type <node> sys_view_cast_opt
 %type <node> column_list_with_boost with_param_column_ref
 %type <node> es_sql_opt
-%type <node> file_table_expr
+%type <node> file_table_expr file_table_kind
 %type <node> hybrid_search_expr hybrid_search_param
 %type <node> vector_similarity_expr vector_similarity_metric
 %type <node> algorithm_opt lock_opt
@@ -585,6 +585,7 @@ stmt:
   | drop_table_stmt         { $$ = $1; check_question_mark($$, result); }
   | drop_view_stmt          { $$ = $1; check_question_mark($$, result); }
   | explain_stmt            { $$ = $1; question_mark_issue($$, result); }
+  | copy_stmt               { $$ = $1; question_mark_issue($$, result); }
   | create_outline_stmt     { $$ = $1; question_mark_issue($$, result); }
   | alter_outline_stmt      { $$ = $1; question_mark_issue($$, result); }
   | drop_outline_stmt       { $$ = $1; check_question_mark($$, result); }
@@ -12258,6 +12259,117 @@ TO explainable_stmt
 $$ = NULL;
 };
 
+
+/*****************************************************************************
+ *
+ *	COPY (query) TO 'file' (options) grammar
+ *
+ * DuckDB's COPY is SELECT ... INTO OUTFILE with a different option spelling, so
+ * the statement is rewritten onto the existing FORMAT option list:
+ *   format csv      -> TYPE = 'csv'
+ *   header          -> PARSE_HEADER = 1, which the writer honours by emitting the
+ *                      column names as the first line
+ *   nullstr 'X'     -> NULL_IF_EXETERNAL = ('X')
+ *
+ *****************************************************************************/
+copy_stmt:
+COPY '(' select_stmt ')' TO STRING_VALUE '(' copy_option_list ')'
+{
+  ParseNode *into_node = NULL;
+  ParseNode *format_list = NULL;
+  ParseNode *chain = NULL;
+  /* CSV separates fields with commas, while SELECT ... INTO OUTFILE defaults to
+     tabs, so the delimiter is pinned here rather than inherited. The option
+     chain is rebuilt flat because merge_nodes only flattens one level. */
+  ParseNode *leaf[8];
+  int leaf_cnt = 0;
+  ParseNode *walk = $8;
+  if (NULL == $3 || T_SELECT != $3->type_) {
+    yyerror(&@3, result, "COPY source must be a select\n");
+    YYABORT_PARSE_SQL_ERROR;
+  }
+  while (NULL != walk && leaf_cnt < 8) {
+    if (T_LINK_NODE == walk->type_ && walk->num_child_ >= 2) {
+      leaf[leaf_cnt++] = walk->children_[1];
+      walk = walk->children_[0];
+    } else {
+      leaf[leaf_cnt++] = walk;
+      walk = NULL;
+    }
+  }
+  {
+    ParseNode *delim_val = NULL;
+    ParseNode *delim_item = NULL;
+    malloc_terminal_node(delim_val, result->malloc_pool_, T_VARCHAR);
+    dup_string_to_node(delim_val, result->malloc_pool_, ",");
+    malloc_non_terminal_node(delim_item, result->malloc_pool_, T_FIELD_TERMINATED_STR,
+                             1, delim_val);
+    chain = delim_item;
+  }
+  for (int i = leaf_cnt - 1; i >= 0; --i) {
+    if (NULL != leaf[i]) {
+      ParseNode *linked = NULL;
+      malloc_non_terminal_node(linked, result->malloc_pool_, T_LINK_NODE, 2, chain, leaf[i]);
+      chain = linked;
+    }
+  }
+  merge_nodes(format_list, result, T_EXTERNAL_FILE_FORMAT, chain);
+  malloc_non_terminal_node(into_node, result->malloc_pool_, T_INTO_OUTFILE, 3,
+                           $6, format_list, NULL);
+  $3->children_[PARSE_SELECT_INTO] = into_node;
+  $$ = $3;
+}
+;
+
+copy_option_list:
+copy_option
+{
+  $$ = $1;
+}
+| copy_option_list ',' copy_option
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3);
+}
+;
+
+copy_option:
+FORMAT expr
+{
+  ParseNode *type_node = NULL;
+  malloc_non_terminal_node(type_node, result->malloc_pool_, T_EXTERNAL_FILE_FORMAT_TYPE, 1, $2);
+  $$ = type_node;
+}
+| NAME_OB
+{
+  if (OB_NOT_NULL($1->str_value_) && 0 == strcasecmp($1->str_value_, "header")) {
+    ParseNode *bool_node = NULL;
+    ParseNode *header_node = NULL;
+    malloc_terminal_node(bool_node, result->malloc_pool_, T_BOOL);
+    bool_node->value_ = 1;
+    malloc_non_terminal_node(header_node, result->malloc_pool_, T_PARSE_HEADER, 1, bool_node);
+    dup_expr_string(header_node, result, @1.first_column, @1.last_column);
+    $$ = header_node;
+  } else {
+    yyerror(&@1, result, "unknown COPY option\n");
+    YYABORT_PARSE_SQL_ERROR;
+  }
+}
+| NAME_OB STRING_VALUE
+{
+  if (OB_NOT_NULL($1->str_value_) && 0 == strcasecmp($1->str_value_, "nullstr")) {
+    ParseNode *value_list = NULL;
+    ParseNode *null_node = NULL;
+    malloc_list_node(value_list, result->malloc_pool_, T_EXPR_LIST, 1, 1, $2);
+    malloc_non_terminal_node(null_node, result->malloc_pool_, T_NULL_IF_EXETERNAL, 1, value_list);
+    dup_expr_string(null_node, result, @1.first_column, @2.last_column);
+    $$ = null_node;
+  } else {
+    yyerror(&@1, result, "unknown COPY option\n");
+    YYABORT_PARSE_SQL_ERROR;
+  }
+}
+;
+
 /*****************************************************************************
  *
  *	explain grammar
@@ -12272,7 +12384,33 @@ explain_or_desc relation_factor opt_desc_column_option
   malloc_non_terminal_node($$, result->malloc_pool_, T_SHOW_COLUMNS, 4, $$, $2, NULL, $3);
 }
 
-| explain_or_desc explainable_stmt { GEN_EXPLAN_STMT($1, $$, 0, 0, $2, NULL, NULL);}
+| explain_or_desc explainable_stmt
+{
+  /* DuckDB answers DESCRIBE SELECT ... with the inferred schema rather than a
+     plan, so that one shape becomes a plain select over the same file table
+     function with describe = 1. Every other form stays an EXPLAIN. */
+  ParseNode *inner_select = (NULL == $2) ? NULL : (T_SELECT == $2->type_ ? $2 : NULL);
+  ParseNode *from_list = (NULL != inner_select && inner_select->num_child_ > PARSE_SELECT_FROM)
+                         ? inner_select->children_[PARSE_SELECT_FROM] : NULL;
+  ParseNode *table_factor = (NULL != from_list && T_FROM_LIST == from_list->type_
+                             && 1 == from_list->num_child_) ? from_list->children_[0] : NULL;
+  if (1 == $1->value_ && NULL != inner_select && NULL != table_factor
+      && T_FILE_TABLE_FUNCTION == table_factor->type_) {
+    ParseNode *key_node = NULL;
+    ParseNode *val_node = NULL;
+    ParseNode *opt_node = NULL;
+    ParseNode *args_node = NULL;
+    make_name_node(key_node, result->malloc_pool_, "describe");
+    malloc_terminal_node(val_node, result->malloc_pool_, T_INT);
+    val_node->value_ = 1;
+    malloc_non_terminal_node(opt_node, result->malloc_pool_, T_OP_EQ, 2, key_node, val_node);
+    push_back_list(result->malloc_pool_, result, args_node, table_factor->children_[0], opt_node);
+    table_factor->children_[0] = args_node;
+    $$ = inner_select;
+  } else {
+    GEN_EXPLAN_STMT($1, $$, 0, 0, $2, NULL, NULL);
+  }
+}
 | explain_or_desc PRETTY explainable_stmt { GEN_EXPLAN_STMT($1, $$, 0, T_PRETTY, $3, NULL, NULL);}
 | explain_or_desc PRETTY_COLOR explainable_stmt { GEN_EXPLAN_STMT($1, $$, 0, T_PRETTY_COLOR, $3, NULL, NULL);}
 
@@ -12312,9 +12450,21 @@ explain_or_desc relation_factor opt_desc_column_option
 ;
 
 explain_or_desc:
-EXPLAIN {$$ = NULL;}
-| DESCRIBE {$$ = NULL;}
-| DESC  {$$ = NULL;}
+EXPLAIN
+{
+  malloc_terminal_node($$, result->malloc_pool_, T_INT);
+  $$->value_ = 0;
+}
+| DESCRIBE
+{
+  malloc_terminal_node($$, result->malloc_pool_, T_INT);
+  $$->value_ = 1;
+}
+| DESC
+{
+  malloc_terminal_node($$, result->malloc_pool_, T_INT);
+  $$->value_ = 1;
+}
 ;
 
 explainable_stmt:
@@ -17458,30 +17608,39 @@ UNNEST '(' simple_expr_list ')'
 }
 ;
 
+file_table_kind:
+READ_CSV
+{
+  malloc_terminal_node($$, result->malloc_pool_, T_INT);
+  $$->value_ = 1;
+}
+| READ_JSON
+{
+  malloc_terminal_node($$, result->malloc_pool_, T_INT);
+  $$->value_ = 2;
+}
+| READ_PARQUET
+{
+  malloc_terminal_node($$, result->malloc_pool_, T_INT);
+  $$->value_ = 3;
+}
+| GLOB
+{
+  malloc_terminal_node($$, result->malloc_pool_, T_INT);
+  $$->value_ = 4;
+}
+;
+
 file_table_expr:
-READ_CSV '(' expr_list ')'
+file_table_kind '(' expr_list ')'
 {
   ParseNode *alias_node = NULL;
   make_name_node(alias_node, result->malloc_pool_, "");
-  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_FUNCTION, 3, $1, $3, alias_node);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_FUNCTION, 3, $3, alias_node, $1);
 }
-| READ_JSON '(' expr_list ')'
+| file_table_kind '(' expr_list ')' relation_name
 {
-  ParseNode *alias_node = NULL;
-  make_name_node(alias_node, result->malloc_pool_, "");
-  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_FUNCTION, 3, $1, $3, alias_node);
-}
-| READ_PARQUET '(' expr_list ')'
-{
-  ParseNode *alias_node = NULL;
-  make_name_node(alias_node, result->malloc_pool_, "");
-  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_FUNCTION, 3, $1, $3, alias_node);
-}
-| GLOB '(' expr_list ')'
-{
-  ParseNode *alias_node = NULL;
-  make_name_node(alias_node, result->malloc_pool_, "");
-  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_FUNCTION, 3, $1, $3, alias_node);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_TABLE_FUNCTION, 3, $3, $5, $1);
 }
 ;
 

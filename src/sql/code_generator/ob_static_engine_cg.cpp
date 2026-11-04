@@ -96,6 +96,7 @@
 #include "sql/engine/basic/ob_select_into_op.h"
 #include "sql/engine/basic/ob_function_table_op.h"
 #include "sql/engine/basic/ob_json_table_op.h"
+#include "sql/engine/basic/ob_file_table_op.h"
 #include "sql/engine/dml/ob_table_insert_op.h"
 #include "sql/engine/basic/ob_stat_collector_op.h"
 #include "sql/engine/opt_statistics/ob_optimizer_stats_gathering_op.h"
@@ -5460,6 +5461,7 @@ int ObStaticEngineCG::generate_spec(ObLogSelectInto &op, ObSelectIntoSpec &spec,
   } else if (OB_FAIL(spec.external_properties_.store_str(op.get_external_properties()))) {
   } else if (OB_FAIL(spec.user_vars_.init(op.get_user_vars().count()))) {
   } else if (OB_FAIL(spec.select_exprs_.init(op.get_select_exprs().count()))) {
+  } else if (OB_FAIL(spec.column_names_.init(op.get_select_exprs().count()))) {
   } else {
     ObString var;
     for (int64_t i = 0; OB_SUCC(ret) && i < op.get_user_vars().count(); ++i) {
@@ -5475,6 +5477,28 @@ int ObStaticEngineCG::generate_spec(ObLogSelectInto &op, ObSelectIntoSpec &spec,
         ret = OB_ERR_UNEXPECTED;
       } else if (OB_FAIL(generate_rt_expr(*select_expr, rt_expr))) {
       } else if (OB_FAIL(spec.select_exprs_.push_back(rt_expr))) {
+      }
+      // The header line COPY writes is the query's own output column names;
+      // ObRawExpr::get_name() yields exactly what the result set shows (an AS
+      // alias becomes the column's alias name during resolution).
+      ObString item_name;
+      char name_buf[1024];
+      int64_t name_pos = 0;
+      if (OB_FAIL(ret)) {
+      } else if (OB_FAIL(select_expr->get_name(name_buf, sizeof(name_buf) - 1, name_pos))) {
+        LOG_WARN("fail to get select item name", K(ret), K(i));
+      } else {
+        name_buf[name_pos] = '\0';
+        // A column reference prints qualified ("FILE_TABLE.id"); the file header
+        // carries the bare column name, which is what the reader sees as a column.
+        char *dot = strrchr(name_buf, '.');
+        char *name_start = (NULL == dot) ? name_buf : dot + 1;
+        ObString raw_name(static_cast<int32_t>(strlen(name_start)), name_start);
+        if (OB_FAIL(ob_write_string(alloc, raw_name, item_name))) {
+          LOG_WARN("fail to copy select item name", K(ret), K(i));
+        } else if (OB_FAIL(spec.column_names_.push_back(item_name))) {
+          LOG_WARN("fail to push select item name", K(ret), K(i));
+        }
       }
     }
     if (OB_SUCC(ret)) {
@@ -5522,6 +5546,72 @@ int ObStaticEngineCG::generate_spec(ObLogFunctionTable &op, ObFunctionTableSpec 
       CK (OB_NOT_NULL(col_item->expr_));
       if (OB_SUCC(ret)
           && col_item->table_id_ == op.get_table_id()
+          && col_item->expr_->is_explicited_reference()) {
+        OZ (mark_expr_self_produced(col_item->expr_));
+        OZ (generate_rt_expr(*col_item->expr_, rt_expr));
+        OZ (spec.column_exprs_.push_back(rt_expr));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObStaticEngineCG::generate_spec(ObLogJsonTable &op, ObFileTableSpec &spec,
+    const bool in_root_job)
+{
+  UNUSED(in_root_job);
+  int ret = OB_SUCCESS;
+  const ObDMLStmt *stmt = op.get_stmt();
+  ObRawExpr *value_raw_expr = nullptr;
+  ObExpr *value_expr = nullptr;
+  if (OB_ISNULL(stmt)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_UNLIKELY(op.get_value_expr().empty())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("file table has no path expression", K(ret));
+  } else if (OB_FAIL(spec.column_exprs_.init(stmt->get_column_size()))) {
+    LOG_WARN("fail to init column exprs", K(ret));
+  } else if (FALSE_IT(value_raw_expr = op.get_value_expr().at(0))) {
+  } else if (OB_ISNULL(value_raw_expr)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(generate_rt_expr(*value_raw_expr, value_expr))) {
+    LOG_WARN("fail to generate path expr", K(ret));
+  } else {
+    spec.value_expr_ = value_expr;
+    spec.has_correlated_expr_ = value_raw_expr->has_flag(CNT_DYNAMIC_PARAM);
+    spec.describe_ = (MulModeTableType::OB_FILE_TABLE_DESCRIBE_TYPE == op.get_table_type());
+    // The resolver recorded the format name in namespace_arr_[0]; glob() has no
+    // extension to guess from, so the operator cannot derive it at open time.
+    {
+      ObSEArray<ObString, 4> name_space;
+      if (OB_FAIL(op.get_namespace_arr(name_space))) {
+        LOG_WARN("fail to read file table format", K(ret));
+      } else if (name_space.empty()) {
+        // leave format_ unknown and let the operator fall back to the path suffix
+      } else {
+        const ObString &fmt_name = name_space.at(0);
+        if (0 == fmt_name.case_compare("csv")) {
+          spec.format_ = FILE_FMT_CSV;
+        } else if (0 == fmt_name.case_compare("jsonl")) {
+          spec.format_ = FILE_FMT_JSONL;
+        } else if (0 == fmt_name.case_compare("parquet")) {
+          spec.format_ = FILE_FMT_PARQUET;
+        } else if (0 == fmt_name.case_compare("glob")) {
+          spec.format_ = FILE_FMT_GLOB;
+        }
+      }
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < op.get_output_exprs().count(); ++i) {
+      if (OB_FAIL(mark_expr_self_produced(op.get_output_exprs().at(i)))) {
+        LOG_WARN("fail to mark output expr", K(ret));
+      }
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < stmt->get_column_size(); ++i) {
+      ObExpr *rt_expr = nullptr;
+      const ColumnItem *col_item = stmt->get_column_item(i);
+      CK (OB_NOT_NULL(col_item));
+      CK (OB_NOT_NULL(col_item->expr_));
+      if (OB_SUCC(ret) && col_item->table_id_ == op.get_table_id()
           && col_item->expr_->is_explicited_reference()) {
         OZ (mark_expr_self_produced(col_item->expr_));
         OZ (generate_rt_expr(*col_item->expr_, rt_expr));
@@ -6120,7 +6210,10 @@ int ObStaticEngineCG::get_phy_op_type(ObLogicalOperator &log_op,
       break;
     }
     case log_op_def::LOG_JSON_TABLE: {
-      type = PHY_JSON_TABLE;
+      auto &jt_op = static_cast<ObLogJsonTable &>(log_op);
+      type = (MulModeTableType::OB_FILE_TABLE_TYPE == jt_op.get_table_type()
+              || MulModeTableType::OB_FILE_TABLE_DESCRIBE_TYPE == jt_op.get_table_type())
+                 ? PHY_FILE_TABLE : PHY_JSON_TABLE;
       break;
     }
     case log_op_def::LOG_MONITORING_DUMP: {

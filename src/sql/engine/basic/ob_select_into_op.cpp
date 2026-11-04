@@ -36,7 +36,8 @@ namespace sql
 
 OB_SERIALIZE_MEMBER(ObSelectIntoOpInput, task_id_, sqc_id_);
 OB_SERIALIZE_MEMBER((ObSelectIntoSpec, ObOpSpec), into_type_, user_vars_, outfile_name_,
-    field_str_, line_str_, closed_cht_, is_optional_, select_exprs_, is_single_, max_file_size_,
+    field_str_, line_str_, closed_cht_, is_optional_, select_exprs_, column_names_,
+    is_single_, max_file_size_,
     escaped_cht_, cs_type_, parallel_, buffer_size_, is_overwrite_,
     external_properties_);
 
@@ -1227,6 +1228,31 @@ int ObSelectIntoOp::check_secure_file_path(ObString file_name)
   return ret;
 }
 
+int ObSelectIntoOp::write_header_line(ObCsvFileWriter &data_writer)
+{
+  int ret = OB_SUCCESS;
+  const ObIArray<ObString> &names = MY_SPEC.column_names_;
+  for (int64_t i = 0; OB_SUCC(ret) && i < names.count(); ++i) {
+    ObString name = names.at(i);
+    ObObj value;
+    value.set_varchar(name);
+    value.set_collation_type(cs_type_);
+    if (OB_FAIL(write_obj_to_file(value, data_writer))) {
+      LOG_WARN("fail to write header name", K(ret), K(i), K(name));
+    } else if (i + 1 < names.count()
+               && OB_FAIL(write_obj_to_file(field_str_, data_writer))) {
+      LOG_WARN("fail to write header separator", K(ret), K(i));
+    }
+  }
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(write_obj_to_file(line_str_, data_writer))) {
+    LOG_WARN("fail to write header line terminator", K(ret));
+  } else {
+    header_written_ = true;
+  }
+  return ret;
+}
+
 int ObSelectIntoOp::create_the_only_data_writer(ObExternalFileWriter *&data_writer)
 {
   int ret = OB_SUCCESS;
@@ -1244,6 +1270,17 @@ int ObSelectIntoOp::create_the_only_data_writer(ObExternalFileWriter *&data_writ
   } else if (ObExternalFileFormat::FormatType::CSV_FORMAT == format_type_ && MY_SPEC.buffer_size_ > 0) {
     csv_data_writer = static_cast<ObCsvFileWriter*>(data_writer);
     if (OB_FAIL(csv_data_writer->alloc_buf(ctx_.get_allocator(), MY_SPEC.buffer_size_))) {
+    }
+  }
+  // COPY ... (header): PARSE_HEADER is the one property that also means "the file
+  // starts with the column names", so the writer honours it on the way out.
+  if (OB_SUCC(ret) && !MY_SPEC.external_properties_.str_.empty()
+      && external_properties_.csv_format_.parse_header_ && !header_written_) {
+    csv_data_writer = static_cast<ObCsvFileWriter*>(data_writer);
+    if (OB_FAIL(write_header_line(*csv_data_writer))) {
+      LOG_WARN("fail to write csv header", K(ret));
+    } else if (OB_FAIL(csv_data_writer->flush_shared_buf(shared_buf_))) {
+      LOG_WARN("fail to flush after the header", K(ret));
     }
   }
   return ret;

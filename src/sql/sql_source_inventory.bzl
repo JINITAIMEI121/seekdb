@@ -228,6 +228,8 @@ SQL_UNITY_GROUPS = [
             "src/sql/engine/basic/ob_group_join_buffer.cpp",
             "src/sql/engine/basic/ob_hash_partitioning_infrastructure_op.cpp",
             "src/sql/engine/basic/ob_json_table_op.cpp",
+            "src/sql/engine/basic/ob_file_table_reader.cpp",
+            "src/sql/engine/basic/ob_file_table_op.cpp",
             "src/sql/engine/basic/ob_limit_op.cpp",
             "src/sql/engine/basic/ob_material_op_impl.cpp",
             "src/sql/engine/basic/ob_material_op.cpp",

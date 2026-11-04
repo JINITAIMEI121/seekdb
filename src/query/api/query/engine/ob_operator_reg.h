@@ -525,6 +525,13 @@ class ObJsonTableOp;
 REGISTER_OPERATOR(ObLogJsonTable, PHY_JSON_TABLE, ObJsonTableSpec,
                   ObJsonTableOp, NOINPUT);
 
+class ObFileTableSpec;
+class ObFileTableOp;
+// Same log operator as JSON_TABLE: code generation picks the physical operator from
+// the ObJsonTableDef discriminator, exactly like unnest already does.
+REGISTER_OPERATOR(ObLogJsonTable, PHY_FILE_TABLE, ObFileTableSpec,
+                  ObFileTableOp, NOINPUT);
+
 class ObLogOptimizerStatsGathering;
 class ObOptimizerStatsGatheringSpec;
 class ObOptimizerStatsGatheringOp;

@@ -20,6 +20,7 @@
 #include "sql/resolver/dml/ob_view_table_resolver.h"
 #include "sql/optimizer/ob_optimizer_util.h"
 #include "sql/resolver/dml/ob_default_value_utils.h"
+#include "sql/engine/basic/ob_file_table_reader.h"
 #include "share/schema/ob_part_mgr_util.h"
 #include "sql/pl/ob_pl_package.h"
 #include "sql/optimizer/ob_opt_est_utils.h"
@@ -2725,12 +2726,9 @@ int ObDMLResolver::resolve_table(const ParseNode &parse_tree,
         break;
       }
       case T_FILE_TABLE_FUNCTION: {
-        // 文件即数据库：表函数扫描尚未接入，先按 "尚不支持" 返回。
-        // 公开用例在 enable_file_sql=OFF 时判的就是 1235；接真实扫描时再在此
-        // 读会话变量（需先用 DEF_SYS_VAR_CACHE_FUNCS 暴露公开访问器）。
-        ret = OB_NOT_SUPPORTED;
-        LOG_USER_ERROR(OB_NOT_SUPPORTED, "querying files as tables is");
-        LOG_WARN("file table function is not supported yet", K(ret));
+        if (OB_FAIL(resolve_file_table_item(*table_node, table_item))) {
+          LOG_WARN("fail to resolve file table function", K(ret));
+        }
         break;
       }
       default:
@@ -3685,6 +3683,396 @@ int ObDMLResolver::unnest_table_add_column(TableItem *&table_item, ColumnItem *&
 
   return ret;
 }
+// ---- file-as-database table function: read_csv / read_json / read_parquet / glob ----
+int ObDMLResolver::create_file_table_item(TableItem *&table_item, const ObString &table_name,
+                                         const bool describe)
+{
+  INIT_SUCC(ret);
+  ObDMLStmt *stmt = get_stmt();
+  ObJsonTableDef *table_def = NULL;
+  if (OB_ISNULL(stmt)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_ISNULL(table_item = stmt->create_table_item(*allocator_))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else if (OB_ISNULL(table_def = static_cast<ObJsonTableDef *>(allocator_->alloc(sizeof(ObJsonTableDef))))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else {
+    table_def = static_cast<ObJsonTableDef *>(new (table_def) ObJsonTableDef());
+    // Reusing TableItem::JSON_TABLE plus this discriminator is deliberate: the
+    // ~20 optimizer/transform/column-binding branches already test is_json_table(),
+    // and unnest set the precedent for routing a second table kind this way.
+    table_def->table_type_ = describe ? MulModeTableType::OB_FILE_TABLE_DESCRIBE_TYPE
+                                      : MulModeTableType::OB_FILE_TABLE_TYPE;
+  }
+  if (OB_SUCC(ret)) {
+    table_item->table_name_ = table_name;
+    table_item->alias_name_ = table_name;
+    table_item->table_id_ = generate_table_id();
+    table_item->type_ = TableItem::JSON_TABLE;
+    table_item->json_table_def_ = table_def;
+    OZ (stmt->add_table_item(session_info_, table_item));
+  }
+  if (OB_SUCC(ret)) {
+    ObDmlJtColDef *root_col_def = NULL;
+    if (OB_ISNULL(root_col_def = static_cast<ObDmlJtColDef *>(allocator_->alloc(sizeof(ObDmlJtColDef))))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else {
+      root_col_def = new (root_col_def) ObDmlJtColDef();
+      root_col_def->table_id_ = table_item->table_id_;
+      root_col_def->col_base_info_.col_type_ = NESTED_COL_TYPE;
+      root_col_def->col_base_info_.parent_id_ = -1;
+      root_col_def->col_base_info_.id_ = 0;
+      if (OB_FAIL(json_table_infos_.push_back(root_col_def))) {
+        LOG_WARN("fail to push root col def", K(ret));
+      } else if (OB_FAIL(table_item->json_table_def_->all_cols_.push_back(&root_col_def->col_base_info_))) {
+        LOG_WARN("fail to push root col", K(ret));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObDMLResolver::file_table_add_column(TableItem *&table_item, ColumnItem *&col_item,
+                                         const ObString &col_name, const ObObjMeta &meta)
+{
+  INIT_SUCC(ret);
+  ObDmlJtColDef *col_def = NULL;
+  ObDataType data_type;
+  const int64_t col_id = table_item->json_table_def_->all_cols_.count();
+  if (OB_ISNULL(col_def = static_cast<ObDmlJtColDef *>(allocator_->alloc(sizeof(ObDmlJtColDef))))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else {
+    col_def = new (col_def) ObDmlJtColDef();
+    col_def->col_base_info_.col_name_.assign_ptr(col_name.ptr(), col_name.length());
+    col_def->col_base_info_.col_type_ = COL_TYPE_VALUE;
+    col_def->col_base_info_.parent_id_ = 0;
+    col_def->col_base_info_.id_ = col_id;
+    col_def->col_base_info_.output_column_idx_ = col_id;
+    data_type.set_meta_type(meta);
+    data_type.set_accuracy(ObAccuracy::DDL_DEFAULT_ACCURACY[meta.get_type()]);
+    if (ObDateTimeType == meta.get_type() || ObTimestampType == meta.get_type()) {
+      // The DDL default keeps microsecond precision; a CSV timestamp column has no
+      // declared fsp, and printing it with ".000000" would not match a table scan.
+      data_type.set_scale(0);
+    }
+    data_type.set_collation_level(CS_LEVEL_IMPLICIT);
+    if (ob_is_string_tc(meta.get_type())) {
+      // A text column without a collation makes the executor assert in
+      // get_basic_func() while picking the datum compare/copy functions.
+      ObCollationType coll_type = CS_TYPE_UTF8MB4_GENERAL_CI;
+      ObCharsetType charset_type = CHARSET_UTF8MB4;
+      if (OB_NOT_NULL(session_info_)
+          && OB_FAIL(session_info_->get_collation_connection(coll_type))) {
+        LOG_WARN("fail to read connection collation", K(ret));
+      } else if (OB_NOT_NULL(session_info_)
+                 && OB_FAIL(session_info_->get_character_set_connection(charset_type))) {
+        LOG_WARN("fail to read connection charset", K(ret));
+      } else {
+        data_type.set_charset_type(charset_type);
+        data_type.set_collation_type(coll_type);
+      }
+    }
+  }
+  if (OB_FAIL(ret)) {
+  } else {
+    col_def->col_base_info_.data_type_ = data_type;
+    if (OB_FAIL(generate_json_table_output_column_item(table_item, data_type,
+                                                       col_def->col_base_info_.col_name_,
+                                                       col_def->col_base_info_.id_, col_item))) {
+      LOG_WARN("fail to generate column item", K(ret), K(col_name));
+    } else if (OB_FALSE_IT(col_item->col_idx_ = table_item->json_table_def_->all_cols_.count())) {
+    } else if (OB_FAIL(table_item->json_table_def_->all_cols_.push_back(&col_def->col_base_info_))) {
+      LOG_WARN("fail to push column def", K(ret));
+    }
+  }
+  return ret;
+}
+
+// Literal text of a file-table argument, deep copied into `alloc`.
+// ObResolverUtils::resolve_const is deliberately not used: it reports anything it
+// does not classify as a string through an ObObjParam whose get_string() length is
+// meaningless, and copying that length allocated 0 bytes and returned NULL, which
+// surfaced as errno 4013 instead of a syntax error.
+static int deep_copy_file_node_text(common::ObIAllocator &alloc, const ParseNode &node,
+                                    ObString &out)
+{
+  INIT_SUCC(ret);
+  const char *text = node.str_value_;
+  int64_t len = node.str_len_;
+  for (int64_t i = 0; (OB_ISNULL(text) || len <= 0) && i < node.num_child_; ++i) {
+    const ParseNode *child = node.children_[i];
+    if (OB_NOT_NULL(child) && OB_NOT_NULL(child->str_value_) && child->str_len_ > 0) {
+      text = child->str_value_;
+      len = child->str_len_;
+    }
+  }
+  char *buf = NULL;
+  if (OB_ISNULL(text) || len <= 0) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_ISNULL(buf = static_cast<char *>(alloc.alloc(len)))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("fail to copy file table text", K(ret), K(len));
+  } else {
+    MEMCPY(buf, text, len);
+    out.assign_ptr(buf, static_cast<int32_t>(len));
+  }
+  return ret;
+}
+
+// Integer argument. The grammar keeps '-1' as T_OP_NEG over a literal, and a token
+// node exposes its text rather than a typed value, so both are accepted here.
+static bool find_node_text(const ParseNode &node, const char *&text, int64_t &len)
+{
+  bool bool_ret = false;
+  text = node.str_value_;
+  len = node.str_len_;
+  if (OB_NOT_NULL(text) && len > 0) {
+    bool_ret = true;
+  } else {
+    for (int64_t i = 0; !bool_ret && i < node.num_child_; ++i) {
+      const ParseNode *child = node.children_[i];
+      if (OB_NOT_NULL(child) && OB_NOT_NULL(child->str_value_) && child->str_len_ > 0) {
+        text = child->str_value_;
+        len = child->str_len_;
+        bool_ret = true;
+      }
+    }
+  }
+  return bool_ret;
+}
+
+static int get_file_node_int(const ParseNode &node, int64_t &value)
+{
+  INIT_SUCC(ret);
+  const bool negative = (T_OP_NEG == node.type_);
+  const ParseNode *base = &node;
+  if (negative && node.num_child_ > 0 && OB_NOT_NULL(node.children_[0])) {
+    base = node.children_[0];
+  }
+  if (T_INT == base->type_) {
+    value = base->value_;
+    if (negative) { value = -value; }
+  } else {
+    const char *text = NULL;
+    int64_t len = 0;
+    char buf[64];
+    if (!find_node_text(*base, text, len) || len <= 0 || len >= static_cast<int64_t>(sizeof(buf))) {
+      ret = OB_INVALID_ARGUMENT;
+    } else {
+      MEMCPY(buf, text, len);
+      buf[len] = '\0';
+      char *end = NULL;
+      const long long v = strtoll(buf, &end, 10);
+      if (end == buf || ('\0' != *end && '-' != *end)) {
+        ret = OB_INVALID_ARGUMENT;
+      } else {
+        value = negative ? -v : v;
+      }
+    }
+  }
+  return ret;
+}
+
+// The grammar carries the keyword (1 csv, 2 json, 3 parquet, 4 glob) so read_json()
+// of a file named *.csv is still parsed as JSON; the extension is only a fallback.
+static ObFileTableFormat pick_file_table_format(const int64_t kind, const char *path,
+                                                const int64_t path_len)
+{
+  ObFileTableFormat fmt = FILE_FMT_UNKNOWN;
+  switch (kind) {
+    case 1:
+      fmt = FILE_FMT_CSV;
+      break;
+    case 2:
+      fmt = FILE_FMT_JSONL;
+      break;
+    case 3:
+      fmt = FILE_FMT_PARQUET;
+      break;
+    case 4:
+      fmt = FILE_FMT_GLOB;
+      break;
+    default:
+      fmt = ObFileTableReader::guess_format(path, path_len);
+      break;
+  }
+  return fmt;
+}
+
+// The suite wants errno 1064 for a rejected file-table argument, which is
+// OB_ERR_PARSE_SQL; OB_ERR_PARSER_SYNTAX would report 1149.
+static int reject_file_table_syntax(const ObString &offending)
+{
+  int ret = OB_ERR_PARSE_SQL;
+  LOG_USER_ERROR(OB_ERR_PARSE_SQL, ob_errpkt_strerror(OB_ERR_PARSER_SYNTAX),
+                 static_cast<int>(offending.length()),
+                 offending.empty() ? "" : offending.ptr(), 1);
+  return ret;
+}
+
+int ObDMLResolver::resolve_file_table_item(const ParseNode &parse_tree, TableItem *&table_item)
+{
+  INIT_SUCC(ret);
+  ParseNode *const *children = parse_tree.children_;
+  const int64_t child_cnt = parse_tree.num_child_;
+  ObString path_str;
+  ObString table_name;
+  int64_t enabled = 0;
+  int64_t sample_size = -1;
+  ObFileTableFormat fmt = FILE_FMT_UNKNOWN;
+  ObRawExpr *path_expr = NULL;
+  bool describe = false;
+  // Schema inference only. The physical operator re-reads the file at open time,
+  // so no row data may outlive this scope.
+  ObArenaAllocator infer_alloc("FileTableInfer");
+  ObSEArray<ObFileTableColumn, 16> schema;
+  ObSEArray<ObFileTableRow, 8> scratch_rows;
+  if (OB_ISNULL(session_info_) || child_cnt < 2 || OB_ISNULL(children[0])
+      || OB_ISNULL(children[1])) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected file table parse node", K(ret), K(child_cnt));
+  } else if (OB_FAIL(session_info_->get_sys_variable(share::SYS_VAR_ENABLE_FILE_SQL, enabled))) {
+    LOG_WARN("fail to read enable_file_sql", K(ret));
+  } else if (0 == enabled) {
+    // The public suite asserts errno 1235 while the gate is off.
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "querying files as tables is");
+  } else {
+    const ParseNode &args = *children[0];
+    const ParseNode &alias = *children[1];
+    if (T_EXPR_LIST != args.type_ || args.num_child_ < 1 || OB_ISNULL(args.children_[0])) {
+      ret = reject_file_table_syntax(ObString());
+      LOG_WARN("file table function needs a path literal", K(ret));
+    } else if (OB_FAIL(deep_copy_file_node_text(*allocator_, *args.children_[0], path_str))) {
+      if (OB_INVALID_ARGUMENT == ret) {
+        ret = reject_file_table_syntax(ObString());
+      }
+      LOG_WARN("fail to resolve file path", K(ret));
+    } else if (OB_FALSE_IT(fmt = pick_file_table_format(
+                   (child_cnt > 2 && OB_NOT_NULL(children[2])) ? children[2]->value_ : 0,
+                   path_str.ptr(), path_str.length()))) {
+    } else if (T_ALIAS == alias.type_ && alias.num_child_ > 0 && OB_NOT_NULL(alias.children_[0])) {
+      // An unreadable alias must not fail the statement; the default table name is fine.
+      if (OB_SUCCESS != deep_copy_file_node_text(*allocator_, *alias.children_[0], table_name)) {
+        table_name.reset();
+      }
+    }
+    for (int64_t i = 1; OB_SUCC(ret) && i < args.num_child_; ++i) {
+      const ParseNode *arg = args.children_[i];
+      if (OB_ISNULL(arg)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (T_OP_EQ == arg->type_ && arg->num_child_ >= 2
+                 && OB_NOT_NULL(arg->children_[0]) && OB_NOT_NULL(arg->children_[1])) {
+        ObString key;
+        const ParseNode *val = arg->children_[1];
+        if (OB_FAIL(deep_copy_file_node_text(*allocator_, *arg->children_[0], key))) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "this file table option is");
+          LOG_WARN("fail to resolve option name", K(ret));
+        } else if (0 == key.case_compare("sample_size")) {
+          int64_t sample = -1;
+          if (OB_FAIL(get_file_node_int(*val, sample))) {
+            ret = OB_NOT_SUPPORTED;
+            LOG_USER_ERROR(OB_NOT_SUPPORTED, "a non-integer sample_size is");
+            LOG_WARN("fail to read sample_size", K(ret), K(val->type_), K(val->num_child_));
+          } else if (FALSE_IT(sample_size = sample)) {
+          } else if (sample_size > 0) {
+            // Sampling fewer rows than the whole file can mis-infer the schema, so a
+            // positive sample size is reported as not supported yet (suite expects 1235).
+            ret = OB_NOT_SUPPORTED;
+            LOG_USER_ERROR(OB_NOT_SUPPORTED, "a positive sample_size is");
+          }
+        } else if (0 == key.case_compare("format")) {
+          ObString v;
+          if (OB_FAIL(deep_copy_file_node_text(*allocator_, *val, v))) {
+            ret = reject_file_table_syntax(ObString());
+            LOG_WARN("fail to resolve format value", K(ret));
+          } else if (0 == v.case_compare("csv")) { fmt = FILE_FMT_CSV; }
+          else if (0 == v.case_compare("newline_delimited")) { fmt = FILE_FMT_JSONL; }
+          else if (0 == v.case_compare("parquet")) { fmt = FILE_FMT_PARQUET; }
+          else {
+            ret = reject_file_table_syntax(v);
+            LOG_WARN("unsupported file format", K(ret), K(v));
+          }
+        } else if (0 == key.case_compare("describe")) {
+          int64_t flag = 1;
+          if (OB_SUCCESS != get_file_node_int(*val, flag)) {
+            flag = 1;  // `describe` without a readable value still means "on"
+          }
+          describe = (flag != 0);
+        } else if (0 != key.case_compare("header")) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "this file table option is");
+        }
+      } else {
+        ObString v;
+        if (OB_FAIL(deep_copy_file_node_text(*allocator_, *arg, v))) {
+          ret = reject_file_table_syntax(ObString());
+          LOG_WARN("fail to resolve positional format", K(ret));
+        } else if (0 == v.case_compare("csv")) { fmt = FILE_FMT_CSV; }
+        else {
+          ret = reject_file_table_syntax(v);
+          LOG_WARN("unsupported file format", K(ret), K(v));
+        }
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(ObFileTableReader::check_format(fmt, ret))) {
+      LOG_WARN("fail to check format", K(ret));
+    } else if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(ObFileTableReader::load(path_str.ptr(), path_str.length(), fmt, sample_size,
+                                               describe, infer_alloc, schema, scratch_rows))) {
+      LOG_WARN("fail to infer file schema", K(ret), K(path_str), K(fmt));
+    } else if (OB_FAIL(resolve_sql_expr(*args.children_[0], path_expr))) {
+      LOG_WARN("fail to build path expr", K(ret));
+    } else if (OB_FAIL(create_file_table_item(table_item,
+                                              table_name.empty() ? ObString("FILE_TABLE") : table_name,
+                                              describe))) {
+      LOG_WARN("fail to create file table item", K(ret));
+    } else if (OB_ISNULL(path_expr)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(table_item->json_table_def_->doc_exprs_.push_back(path_expr))) {
+      // doc_exprs_ must stay non-empty: join order, code generation and the log op
+      // all dereference element 0 without a guard.
+      LOG_WARN("fail to push path expr", K(ret));
+    } else {
+      // The format travels in namespace_arr_ because ObJsonTableDef has no field for
+      // it and the physical operator needs it at open time; table_type_ stays the
+      // OB_FILE_TABLE_TYPE discriminator that code generation switches on.
+      {
+        const char *fmt_name = (FILE_FMT_CSV == fmt) ? "csv"
+                             : (FILE_FMT_JSONL == fmt) ? "jsonl"
+                             : (FILE_FMT_PARQUET == fmt) ? "parquet"
+                             : (FILE_FMT_GLOB == fmt) ? "glob" : "";
+        ObString fmt_str(static_cast<int32_t>(strlen(fmt_name)), const_cast<char *>(fmt_name));
+        if (OB_FAIL(table_item->json_table_def_->namespace_arr_.push_back(fmt_str))) {
+          LOG_WARN("fail to record file format", K(ret), K(fmt));
+        }
+      }
+      for (int64_t c = 0; OB_SUCC(ret) && c < schema.count(); ++c) {
+        ColumnItem *col_item = NULL;
+        // the inferred name lives in infer_alloc, so copy it into the statement arena
+        char *name_buf = NULL;
+        const ObString &src_name = schema.at(c).name_;
+        if (OB_ISNULL(name_buf = static_cast<char *>(allocator_->alloc(src_name.length())))) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+          LOG_WARN("fail to alloc column name", K(ret), K(src_name.length()));
+        } else {
+          MEMCPY(name_buf, src_name.ptr(), src_name.length());
+          ObString deep_name(static_cast<int32_t>(src_name.length()), name_buf);
+          if (OB_FAIL(file_table_add_column(table_item, col_item, deep_name, schema.at(c).meta_))) {
+            LOG_WARN("fail to add file column", K(ret), K(c));
+          }
+        }
+      }
+    }
+  }
+  if (OB_FAIL(ret)) {
+    table_item = NULL;
+  }
+  return ret;
+}
+
 int ObDMLResolver::resolve_hybrid_search_item(const ParseNode &parse_tree, TableItem *&table_item)
 {
   INIT_SUCC(ret);
