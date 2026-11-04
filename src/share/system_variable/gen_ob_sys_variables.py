@@ -266,6 +266,12 @@ def make_cpp_file(pdir, cpp_file_name, sorted_list):
         out = "      ObSysVars[" + str(var_num) + "]." + str(attribute_key) + "_ = " + make_flags_value(attribute_value) + " ;\n"
       elif attribute_key == "data_type":
         out = "      ObSysVars[" + str(var_num) + "]." + str(attribute_key) + "_ = " + make_type_value(attribute_value) + " ;\n"
+      elif attribute_key == "enum_names":
+        # Keep the Python-2 repr spelling ("[u'a', u'b']") the checked-in table already
+        # carries: this text is a compiled-in literal, so letting the Python-3 repr
+        # through would silently rewrite every enum variable's enum_names_.
+        rendered = "[" + ", ".join("u'" + str(v) + "'" for v in attribute_value) + "]"
+        out = "      ObSysVars[" + str(var_num) + "]." + str(attribute_key) + "_ = \"" + rendered + "\" ;\n"
       else:
         out = "      ObSysVars[" + str(var_num) + "]." + str(attribute_key) + "_ = \"" + str(attribute_value) + "\" ;\n"
       cpp_file.write(out)
