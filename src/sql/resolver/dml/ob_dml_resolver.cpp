@@ -2724,6 +2724,15 @@ int ObDMLResolver::resolve_table(const ParseNode &parse_tree,
         }
         break;
       }
+      case T_FILE_TABLE_FUNCTION: {
+        // 文件即数据库：表函数扫描尚未接入，先按 "尚不支持" 返回。
+        // 公开用例在 enable_file_sql=OFF 时判的就是 1235；接真实扫描时再在此
+        // 读会话变量（需先用 DEF_SYS_VAR_CACHE_FUNCS 暴露公开访问器）。
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "querying files as tables is");
+        LOG_WARN("file table function is not supported yet", K(ret));
+        break;
+      }
       default:
         /* won't be here */
         ret = OB_ERR_PARSER_SYNTAX;
