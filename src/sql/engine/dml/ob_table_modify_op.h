@@ -98,6 +98,20 @@ private:
                              const ObForeignKeyArg &fk_arg, bool &is_self_ref);
 };
 
+// AI COLUMN (2026 competition): an async AI column is answered by a background worker, so
+// the DML that inserts a row, or changes a column its expression reads, has to enqueue a
+// task row inside the user's own transaction (the public cases read it before commit).
+class AiColumnHandle
+{
+public:
+  static int has_async_ai_column(ObExecContext &ctx, const uint64_t table_id, bool &has_async);
+  static int do_handle_after_row(ObTableModifyOp &op,
+                                 const ObDMLBaseCtDef &dml_ctdef,
+                                 ObDMLBaseRtDef &dml_rtdef,
+                                 const bool is_update,
+                                 const bool is_delete);
+};
+
 class ObTableModifyOp;
 class ObTableModifySpec : public ObOpSpec
 {
@@ -226,6 +240,15 @@ public:
 
 public:
   int open_inner_conn();
+  int insert_ai_column_task_row(const int64_t task_id,
+                                const uint64_t table_id,
+                                const uint64_t column_id,
+                                const common::ObString &rowkey_predicate,
+                                const int64_t request_id);
+  int delete_ai_column_task_row(const int64_t task_id);
+  uint64_t ai_after_row_table_id_ = OB_INVALID_ID;
+  bool ai_after_row_cached_ = false;
+  bool ai_after_row_result_ = false;
   int close_inner_conn();
   int begin_nested_session(bool skip_cur_stmt_tables);
   int end_nested_session();
@@ -238,7 +261,8 @@ public:
   bool has_before_row_trigger(const ObDMLBaseCtDef &dml_ctdef) { return dml_ctdef.is_primary_index_ && dml_ctdef.trig_ctdef_.all_tm_points_.has_before_row(); }
   bool has_after_row_trigger(const ObDMLBaseCtDef &dml_ctdef) { return dml_ctdef.is_primary_index_ && dml_ctdef.trig_ctdef_.all_tm_points_.has_after_row(); }
   bool need_foreign_key_check(const ObDMLBaseCtDef &dml_ctdef) { return dml_ctdef.is_primary_index_ && dml_ctdef.fk_args_.count() > 0; }
-  bool need_after_row_process(const ObDMLBaseCtDef &dml_ctdef) { return need_foreign_key_check(dml_ctdef) || has_after_row_trigger(dml_ctdef); }
+  // extended for async AI columns, which also need the after-row pass to enqueue a task
+  bool need_after_row_process(const ObDMLBaseCtDef &dml_ctdef);
   void set_execute_single_row() { execute_single_row_ = true; }
   void unset_execute_single_row() { execute_single_row_ = false; }
   bool get_execute_single_row() const { return execute_single_row_; }

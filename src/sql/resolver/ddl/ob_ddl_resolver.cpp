@@ -2133,10 +2133,12 @@ int ObDDLResolver::build_ai_companion_name(ObIAllocator &alloc,
 
 int ObDDLResolver::build_ai_column_spec_comment(ObIAllocator &alloc,
                                                 const AiColumnSpec &spec,
-                                                const bool is_json_result,
+                                                const common::ObObjType result_type,
                                                 ObString &comment)
 {
   INIT_SUCC(ret);
+  const bool is_json_result = (ObJsonType == result_type);
+  const bool is_integer_result = ob_is_integer_type(result_type);
   char *buf = NULL;
   int64_t pos = 0;
   const int64_t need = MAX_COMMENT_TEXT_LENGTH + 1;
@@ -2154,7 +2156,12 @@ int ObDDLResolver::build_ai_column_spec_comment(ObIAllocator &alloc,
                                         "Return exactly one valid JSON value. %.*s",
                                         spec.expr_text_.length(), spec.expr_text_.ptr()))) {
     SQL_RESV_LOG(WARN, "fail to append json instruction", K(ret));
-  } else if (!is_json_result
+  } else if (is_integer_result
+             && OB_FAIL(databuff_printf(buf, need, pos,
+                                        "Return one base-10 integer. %.*s",
+                                        spec.expr_text_.length(), spec.expr_text_.ptr()))) {
+    SQL_RESV_LOG(WARN, "fail to append integer instruction", K(ret));
+  } else if (!is_json_result && !is_integer_result
              && OB_FAIL(databuff_printf(buf, need, pos, "%.*s",
                                          spec.expr_text_.length(), spec.expr_text_.ptr()))) {
     SQL_RESV_LOG(WARN, "fail to append expression text", K(ret));

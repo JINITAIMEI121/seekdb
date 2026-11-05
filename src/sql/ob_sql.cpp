@@ -1927,6 +1927,157 @@ int ObSql::handle_ps_execute(const ObPsStmtId client_stmt_id,
   return ret;
 }
 
+
+namespace {
+
+// the AI spec of a result column sits in the comment of its __ai_request_<col> companion, and
+// hidden columns are not addressable by name, so the column array has to be walked
+bool is_async_ai_result_column(const share::schema::ObTableSchema &table_schema,
+                               const common::ObString &col_name)
+{
+  static const char PREFIX[] = "__ai_request_";
+  const int64_t prefix_len = static_cast<int64_t>(sizeof(PREFIX)) - 1;
+  bool is_async = false;
+  char name_buf[256];
+  int64_t pos = 0;
+  if (col_name.length() + prefix_len >= static_cast<int64_t>(sizeof(name_buf))) {
+    // too long to have a companion here
+  } else if (0 != databuff_printf(name_buf, sizeof(name_buf), pos, "%s%.*s", PREFIX,
+                                  col_name.length(), col_name.ptr())) {
+    // the buffer above fits the longest possible column name
+  } else {
+    const common::ObString wanted(static_cast<int32_t>(pos), name_buf);
+    for (share::schema::ObTableSchema::const_column_iterator it = table_schema.column_begin();
+         it != table_schema.column_end() && !is_async; ++it) {
+      const share::schema::ObColumnSchemaV2 *c = *it;
+      if (OB_NOT_NULL(c) && 0 == c->get_column_name_str().compare(wanted)
+          && NULL != strstr(c->get_comment_str().ptr(), "sync_mode=async")) {
+        is_async = true;
+      }
+    }
+  }
+  return is_async;
+}
+
+// one row per statement, and one row per sub query level: a statement may not read an async AI
+// column while any row of it is still unanswered, no matter which rows it selects
+int check_ai_column_strict_read_one(const ObDMLStmt &stmt,
+                                    share::schema::ObSchemaGetterGuard &schema_guard,
+                                    common::ObIArray<uint64_t> &checked_tables,
+                                    common::ObIArray<uint64_t> &checked_columns)
+{
+  int ret = OB_SUCCESS;
+  const common::ObIArray<ColumnItem> &columns = stmt.get_column_items();
+  for (int64_t i = 0; OB_SUCC(ret) && i < columns.count(); ++i) {
+    const ColumnItem &item = columns.at(i);
+    const TableItem *table_item = stmt.get_table_item_by_id(item.table_id_);
+    const share::schema::ObTableSchema *table_schema = NULL;
+    const share::schema::ObDatabaseSchema *db_schema = NULL;
+    const share::schema::ObColumnSchemaV2 *ai_col = NULL;
+    bool already = false;
+    if (OB_ISNULL(table_item) || OB_INVALID_ID == table_item->ref_id_
+        || table_item->is_generated_table() || table_item->is_temp_table()) {
+      // no schema table behind this column
+    } else if (OB_FAIL(schema_guard.get_table_schema(table_item->ref_id_, table_schema))) {
+      LOG_WARN("fail to get table schema for strict read", K(ret));
+    } else if (OB_ISNULL(table_schema)
+               || OB_ISNULL(ai_col = table_schema->get_column_schema(item.column_id_))) {
+      // the column is gone
+    } else if (!is_async_ai_result_column(*table_schema, ai_col->get_column_name_str())) {
+      // not an async AI column
+    } else {
+      for (int64_t k = 0; !already && k < checked_columns.count(); ++k) {
+        already = (checked_tables.at(k) == table_item->ref_id_
+                   && checked_columns.at(k) == item.column_id_);
+      }
+    }
+    if (OB_FAIL(ret) || already || OB_ISNULL(table_schema) || OB_ISNULL(ai_col)) {
+      // already handled, or nothing to check
+    } else if (OB_FAIL(schema_guard.get_database_schema(table_schema->get_database_id(),
+                                                       db_schema))) {
+      LOG_WARN("fail to get the database of the ai table", K(ret));
+    } else if (OB_ISNULL(db_schema) || OB_ISNULL(GCTX.sql_proxy_)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("no database schema or proxy for strict read", K(ret));
+    } else if (OB_FAIL(checked_tables.push_back(table_item->ref_id_))
+               || OB_FAIL(checked_columns.push_back(item.column_id_))) {
+      LOG_WARN("fail to remember the checked ai column", K(ret));
+    } else {
+      // an async AI column is expected to hold an answer for every row, so a single NULL means
+      // the answer is still owed, whether or not a task row is alive at this very moment
+      ObSqlString sql;
+      int64_t unanswered = 0;
+      if (OB_FAIL(sql.assign_fmt("SELECT COUNT(*) AS CNT FROM `%.*s`.`%.*s` WHERE `%.*s` IS NULL",
+                                 db_schema->get_database_name_str().length(),
+                                 db_schema->get_database_name_str().ptr(),
+                                 table_schema->get_table_name_str().length(),
+                                 table_schema->get_table_name_str().ptr(),
+                                 ai_col->get_column_name_str().length(),
+                                 ai_col->get_column_name_str().ptr()))) {
+        LOG_WARN("fail to build the ai answer check", K(ret));
+      } else {
+        SMART_VAR(ObMySQLProxy::MySQLResult, res) {
+          ObMySQLResult *result = NULL;
+          if (OB_FAIL(GCTX.sql_proxy_->read(res, sql.ptr()))) {
+            LOG_WARN("fail to check the ai column answers", K(ret), K(sql));
+          } else if (OB_ISNULL(result = res.get_result())) {
+            ret = OB_ERR_UNEXPECTED;
+          } else if (OB_FAIL(result->next())) {
+            LOG_WARN("fail to read the ai answer count", K(ret));
+          } else {
+            EXTRACT_INT_FIELD_MYSQL(*result, "CNT", unanswered, int64_t);
+          }
+        }
+        if (OB_SUCC(ret) && unanswered > 0) {
+          ret = OB_AI_COLUMN_UNFINISHED_TASKS;
+          LOG_USER_ERROR(OB_AI_COLUMN_UNFINISHED_TASKS, table_item->ref_id_,
+                         item.column_id_);
+          LOG_WARN("ai column is not fully answered while strict read is on", K(ret),
+                   "table_id", table_item->ref_id_, "column_id", item.column_id_,
+                   K(unanswered));
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+// AI COLUMN (2026 competition): with ai_column_strict_read on, a statement that reads an async
+// AI column may not see a half answered table. The rule is column wide rather than row wide, and
+// it also applies when the column only shows up inside a sub query. All of this runs only while
+// the variable is on, so every other statement pays nothing for it.
+int check_ai_column_strict_read(ObDMLStmt &stmt,
+                                share::schema::ObSchemaGetterGuard &schema_guard,
+                                ObSQLSessionInfo &session)
+{
+  int ret = OB_SUCCESS;
+  int64_t strict = 0;
+  common::ObSEArray<uint64_t, 8> checked_tables;
+  common::ObSEArray<uint64_t, 8> checked_columns;
+  if (OB_FAIL(session.get_sys_variable(share::SYS_VAR_AI_COLUMN_STRICT_READ, strict))) {
+    LOG_WARN("fail to read ai_column_strict_read", K(ret));
+  } else if (0 == strict) {
+    // the gate is off
+  } else if (OB_FAIL(check_ai_column_strict_read_one(stmt, schema_guard, checked_tables,
+                                                     checked_columns))) {
+    // keep the error, it is the answer the caller wants
+  } else {
+    const common::ObIArray<ObQueryRefRawExpr *> &sub_queries = stmt.get_subquery_exprs();
+    for (int64_t i = 0; OB_SUCC(ret) && i < sub_queries.count(); ++i) {
+      const ObQueryRefRawExpr *qref = sub_queries.at(i);
+      const ObSelectStmt *sub_stmt = (OB_ISNULL(qref)) ? NULL : qref->get_ref_stmt();
+      if (OB_NOT_NULL(sub_stmt)
+          && OB_FAIL(check_ai_column_strict_read_one(*sub_stmt, schema_guard, checked_tables,
+                                                    checked_columns))) {
+        // same error travels up
+      }
+    }
+  }
+  return ret;
+}
+
+} // namespace
+
 OB_INLINE int ObSql::handle_text_query(const ObString &stmt, ObSqlCtx &context, ObResultSet &result)
 {
   int ret = OB_SUCCESS;
@@ -2284,7 +2435,12 @@ int ObSql::generate_physical_plan(ParseResult &parse_result,
   } else if (basic_stmt->is_dml_stmt()
              || basic_stmt->is_explain_stmt()
             ) {
-    if (OB_FAIL(generate_plan(parse_result, pc_ctx, sql_ctx, result, mode, basic_stmt,
+    if (basic_stmt->is_dml_stmt() && OB_NOT_NULL(sql_ctx.schema_guard_)
+        && OB_FAIL(check_ai_column_strict_read(
+               *static_cast<ObDMLStmt *>(basic_stmt), *sql_ctx.schema_guard_,
+               result.get_session()))) {
+      LOG_WARN("ai column strict read rejected the statement", K(ret));
+    } else if (OB_FAIL(generate_plan(parse_result, pc_ctx, sql_ctx, result, mode, basic_stmt,
                              stmt_need_privs))) {
     }
   } else if (stmt::T_EXECUTE == basic_stmt->get_stmt_type() &&

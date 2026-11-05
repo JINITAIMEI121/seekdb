@@ -2219,6 +2219,10 @@ int ObDMLService::handle_after_processing_single_row(ObDMLModifyRowNode &modify_
     }
     if (OB_SUCC(ret) && OB_FAIL(TriggerHandle::do_handle_after_row(op, dml_ctdef.trig_ctdef_, dml_rtdef.trig_rtdef_, dml_event))) {
     }
+    if (OB_SUCC(ret) && OB_FAIL(AiColumnHandle::do_handle_after_row(op, dml_ctdef, dml_rtdef,
+                                                                                                            t_update == dml_event, t_delete == dml_event))) {
+      LOG_WARN("fail to enqueue ai column task", K(ret), K(dml_event));
+    }
   }
   return ret;
 }

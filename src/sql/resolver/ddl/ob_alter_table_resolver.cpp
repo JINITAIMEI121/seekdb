@@ -52,6 +52,175 @@ ObAlterTableResolver::~ObAlterTableResolver()
 }
 
 
+
+namespace {
+
+// the AI spec of a result column lives in the comment of its __ai_request_<col> companion, and
+// hidden columns cannot be looked up by name, so the column array has to be walked
+bool is_ai_result_column(const share::schema::ObTableSchema &table_schema,
+                         const common::ObString &col_name)
+{
+  static const char PREFIX[] = "__ai_request_";
+  const int64_t prefix_len = static_cast<int64_t>(sizeof(PREFIX)) - 1;
+  bool is_ai = false;
+  char name_buf[256];
+  int64_t pos = 0;
+  if (col_name.length() + prefix_len >= static_cast<int64_t>(sizeof(name_buf))) {
+    // a column name that long cannot have a companion here
+  } else if (0 != databuff_printf(name_buf, sizeof(name_buf), pos, "%s%.*s", PREFIX,
+                                  col_name.length(), col_name.ptr())) {
+    // the buffer is sized above for the longest possible name
+  } else {
+    const common::ObString wanted(static_cast<int32_t>(pos), name_buf);
+    for (share::schema::ObTableSchema::const_column_iterator it = table_schema.column_begin();
+         it != table_schema.column_end() && !is_ai; ++it) {
+      const share::schema::ObColumnSchemaV2 *c = *it;
+      is_ai = (OB_NOT_NULL(c) && 0 == c->get_column_name_str().compare(wanted));
+    }
+  }
+  return is_ai;
+}
+
+// READY means the row currently holds an answer, FAILED means it does not. Only the unquoted
+// spelling is the pseudo column; `status` stays the user's own column, which is why this runs on
+// the original text instead of a resolved expression.
+int rewrite_ai_retry_status(const char *where_text, const common::ObString &col_name,
+                            common::ObSqlString &out)
+{
+  int ret = OB_SUCCESS;
+  static const char STATUS[] = "status";
+  const int64_t status_len = static_cast<int64_t>(sizeof(STATUS)) - 1;
+  if (OB_ISNULL(where_text)) {
+    // no predicate: every row of this column is retried
+  } else {
+    const int64_t len = static_cast<int64_t>(strlen(where_text));
+    int64_t i = 0;
+    while (OB_SUCC(ret) && i < len) {
+      const char c = where_text[i];
+      bool matched = false;
+      if ('`' == c || '\'' == c || '"' == c) {
+        // a quoted identifier or literal, copy verbatim
+      } else if (i + status_len <= len && 0 == STRNCASECMP(where_text + i, STATUS, status_len)) {
+        const bool left_ok = (0 == i) || !(isalnum(where_text[i - 1]) || '_' == where_text[i - 1]);
+        const bool right_ok = (i + status_len >= len)
+                              || !(isalnum(where_text[i + status_len])
+                                   || '_' == where_text[i + status_len]);
+        if (left_ok && right_ok) {
+          int64_t j = i + status_len;
+          while (j < len && isspace(where_text[j])) { ++j; }
+          if (j < len && '=' == where_text[j]) {
+            ++j;
+            while (j < len && isspace(where_text[j])) { ++j; }
+            bool ready = false;
+            bool failed = false;
+            if (j + 7 <= len && 0 == STRNCASECMP(where_text + j, "'READY'", 7)) {
+              ready = true;
+              j += 7;
+            } else if (j + 8 <= len && 0 == STRNCASECMP(where_text + j, "'FAILED'", 8)) {
+              failed = true;
+              j += 8;
+            }
+            if (ready || failed) {
+              matched = true;
+              if (OB_FAIL(out.append_fmt("`%.*s` %s", col_name.length(), col_name.ptr(),
+                                         ready ? "IS NOT NULL" : "IS NULL"))) {
+                SQL_RESV_LOG(WARN, "fail to rewrite the retry predicate", K(ret));
+              } else {
+                i = j;
+              }
+            }
+          }
+        }
+      }
+      if (OB_SUCC(ret) && !matched) {
+        if (OB_FAIL(out.append(&c, 1))) {
+          SQL_RESV_LOG(WARN, "fail to copy the retry predicate", K(ret));
+        } else {
+          ++i;
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+// A retry invalidates the cached answer and asks for it again for exactly the rows the
+// predicate picks, which is literally an UPDATE writing NULL into that column: the DML hook
+// then enqueues one task per touched row, and rows that do not match create no task at all.
+int retry_ai_column(const share::schema::ObTableSchema &table_schema,
+                    const common::ObString &db_name,
+                    const common::ObString &tbl_name,
+                    const ParseNode &column_node,
+                    const ParseNode *where_node,
+                    common::ObMySQLProxy *sql_proxy)
+{
+  int ret = OB_SUCCESS;
+  common::ObSqlString sql;
+  common::ObString col_name;
+  const char *col_text = NULL;
+  if (OB_ISNULL(sql_proxy)) {
+    ret = OB_ERR_UNEXPECTED;
+    SQL_RESV_LOG(WARN, "no sql proxy to run the ai column retry", K(ret));
+  } else if (column_node.num_child_ > 0 && OB_NOT_NULL(column_node.children_)
+             && OB_NOT_NULL(column_node.children_[0])
+             && OB_NOT_NULL(column_node.children_[0]->str_value_)) {
+    col_text = column_node.children_[0]->str_value_;
+  } else if (OB_NOT_NULL(column_node.str_value_)) {
+    col_text = column_node.str_value_;
+  }
+  if (OB_ISNULL(col_text)) {
+    ret = OB_ERR_UNEXPECTED;
+    SQL_RESV_LOG(WARN, "retry ai column without a name", K(ret));
+  } else if (FALSE_IT(col_name = common::ObString(static_cast<int32_t>(strlen(col_text)),
+                                                  col_text))) {
+  } else if (!is_ai_result_column(table_schema, col_name)) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "retrying a column that is not an AI column");
+    SQL_RESV_LOG(WARN, "the retry target is not an AI column", K(ret), K(col_name));
+  } else {
+    const char *where_text = NULL;
+    if (NULL != where_node) {
+      if (NULL != where_node->str_value_) {
+        where_text = where_node->str_value_;
+      } else if (NULL != where_node->children_ && where_node->num_child_ > 0
+                 && OB_NOT_NULL(where_node->children_[0])
+                 && NULL != where_node->children_[0]->str_value_) {
+        where_text = where_node->children_[0]->str_value_;
+      }
+    }
+    if (NULL != where_text) {
+      // the span starts at the WHERE keyword, which the UPDATE has to add back itself
+      while (NULL != where_text && isspace(*where_text)) { ++where_text; }
+      if (NULL != where_text && 0 == STRNCASECMP(where_text, "where", 5)) {
+        where_text += 5;
+        while (isspace(*where_text)) { ++where_text; }
+      }
+    }
+    common::ObSqlString predicate;
+    if (OB_FAIL(rewrite_ai_retry_status(where_text, col_name, predicate))) {
+      SQL_RESV_LOG(WARN, "fail to prepare the retry predicate", K(ret));
+    } else if (OB_FAIL(sql.assign_fmt("UPDATE `%.*s`.`%.*s` SET `%.*s` = NULL",
+                                      db_name.length(), db_name.ptr(),
+                                      tbl_name.length(), tbl_name.ptr(),
+                                      col_name.length(), col_name.ptr()))) {
+      SQL_RESV_LOG(WARN, "fail to build the retry sql", K(ret));
+    } else if (predicate.length() > 0
+               && OB_FAIL(sql.append_fmt(" WHERE %s", predicate.ptr()))) {
+      SQL_RESV_LOG(WARN, "fail to append the retry predicate", K(ret));
+    } else {
+      int64_t affected = 0;
+      if (OB_FAIL(sql_proxy->write(sql.ptr(), 0 /*group_id*/, affected))) {
+        SQL_RESV_LOG(WARN, "fail to run the ai column retry", K(ret), K(sql));
+      } else {
+        SQL_RESV_LOG(INFO, "ai column retry done", K(sql), K(affected));
+      }
+    }
+  }
+  return ret;
+}
+
+} // namespace
+
 int ObAlterTableResolver::resolve(const ParseNode &parse_tree)
 {
   int ret = OB_SUCCESS;
@@ -424,6 +593,26 @@ int ObAlterTableResolver::resolve_action_list(const ParseNode &node)
           break;
         }
         //deal with add column, alter column, drop column, change column, modify column
+        case T_AI_COLUMN_RETRY: {
+            if (node.num_child_ != 1) {
+              ret = OB_NOT_SUPPORTED;
+              LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                             "combining AI COLUMN RETRY with another ALTER action");
+              SQL_RESV_LOG(WARN, "AI column RETRY cannot be mixed with other actions", K(ret));
+            } else if (OB_ISNULL(action_node->children_) || action_node->num_child_ < 2
+                       || OB_ISNULL(table_schema_) || OB_ISNULL(alter_table_stmt)) {
+              ret = OB_ERR_UNEXPECTED;
+              SQL_RESV_LOG(WARN, "invalid retry ai column parse tree", K(ret));
+            } else {
+              const ObAlterTableArg &arg = alter_table_stmt->get_alter_table_arg();
+              ret = retry_ai_column(*table_schema_,
+                                    arg.alter_table_schema_.get_origin_database_name(),
+                                    arg.alter_table_schema_.get_origin_table_name(),
+                                    *action_node->children_[0],
+                                    action_node->children_[1], params_.sql_proxy_);
+            }
+            break;
+          }
         case T_ALTER_COLUMN_OPTION: {
             alter_table_stmt->set_alter_table_column();
             bool temp_is_modify_column_visibility = false;
@@ -3479,8 +3668,8 @@ int ObAlterTableResolver::add_ai_column_companions_for_alter(
     // an ordinary column, nothing to add
   } else {
     ObString comment;
-    const bool is_json_result = (ObJsonType == column.get_data_type());
-    if (OB_FAIL(build_ai_column_spec_comment(*allocator_, *spec, is_json_result, comment))) {
+    if (OB_FAIL(build_ai_column_spec_comment(*allocator_, *spec, column.get_data_type(),
+                                             comment))) {
       SQL_RESV_LOG(WARN, "fail to build ai column spec comment", K(ret), KPC(spec));
     }
     for (int64_t k = 0; OB_SUCC(ret) && k < 3; ++k) {

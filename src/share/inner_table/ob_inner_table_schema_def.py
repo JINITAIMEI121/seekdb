@@ -2490,8 +2490,11 @@ all_ai_column_task_def = dict(
         ('table_id', 'int', 'false'),
         ('column_id', 'int', 'false'),
         ('rowkey_predicate', 'varchar:1024', 'true'),
-        ('state', 'varchar:32', 'false'),
+        # the public cases compare task.state against integers (3 == waiting for retry)
+        ('state', 'int', 'false', '0'),
         ('retry_count', 'int', 'false', '0'),
+        # earliest time the worker may pick the task up, so retries can back off
+        ('eligible_ts', 'timestamp', 'true'),
         ('request_id', 'int', 'false', '0'),
         ('ret_code', 'int', 'false', '0'),
         ('trace_id', 'varchar:64', 'true')

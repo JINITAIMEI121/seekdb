@@ -244,7 +244,7 @@ END_P SET_VAR DELIMITER
         ON OPTIMIZE /*OPTIMIZER_COSTS*/ OPTION OPTIONALLY OR ORDER OUT OUTER OUTFILE
         PARTITION PRECISION PRIMARY PROCEDURE PURGE
         RANGE READ READS READ_WRITE REAL REFERENCES REGEXP RELEASE RENAME REPEAT REPLACE REQUIRE
-        RESIGNAL RESTRICT RETURN REVOKE RIGHT RLIKE
+        RESIGNAL RESTRICT RETURN RETRY REVOKE RIGHT RLIKE
         SCHEMA SCHEMAS SECOND_MICROSECOND SELECT SENSITIVE SEPARATOR SET SHOW SIGNAL SMALLINT SPATIAL
         SPECIFIC SQL SQLEXCEPTION SQLSTATE SQLWARNING SQL_BIG_RESULT SQL_CALC_FOUND_ROWS
         SQL_SMALL_RESULT SSL SKIP STARTING STORED STRAIGHT_JOIN
@@ -14905,6 +14905,19 @@ opt_set table_option_list_space_seperated
 {
   (void)$1;
   merge_nodes($$, result, T_TABLE_OPTION_LIST, $2);
+}
+| RETRY AI COLUMN column_name opt_where
+{
+  /* ALTER TABLE ... RETRY AI COLUMN <col> [WHERE ...] -- ask the model again for the
+     rows the predicate picks. The predicate keeps its original text so that a
+     backticked "status" still addresses the user's own column rather than the retry
+     pseudo column. */
+  malloc_non_terminal_node($$, result->malloc_pool_, T_AI_COLUMN_RETRY, 2, $4, $5);
+  if (NULL != $5) {
+    // keeps the original predicate text, so that a backticked "status" survives to the
+    // resolver and can still be told apart from the retry pseudo column
+    dup_expr_string($5, result, @5.first_column, @5.last_column);
+  }
 }
 | CONVERT TO CHARACTER SET charset_name opt_collation
 {

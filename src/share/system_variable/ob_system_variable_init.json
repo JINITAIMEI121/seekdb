@@ -10988,5 +10988,18 @@
     "info_cn": "开启后允许把本地 CSV/JSONL/Parquet 文件当表查询",
     "background_cn": "",
     "ref_url": ""
+  },
+  "ai_column_strict_read": {
+    "id": 10755,
+    "name": "ai_column_strict_read",
+    "default_value": "0",
+    "base_value": "0",
+    "data_type": "bool",
+    "info": "reject statements that read an AI column which still has unfinished tasks",
+    "flags": "SESSION | GLOBAL",
+    "publish_version": "1.0.0.0",
+    "info_cn": "开启后，引用了仍有未完成 AI 任务的列的语句直接报错",
+    "background_cn": "",
+    "ref_url": ""
   }
 }

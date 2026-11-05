@@ -33,6 +33,127 @@ using namespace share::schema;
 using namespace pl;
 namespace sql
 {
+namespace {
+
+bool is_ai_word_char(const char c)
+{
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+         || '_' == c || '$' == c;
+}
+
+// the column name appears as a bare identifier in the AI expression text, and not inside a
+// quoted literal, which is what the model is actually being asked about
+bool ai_expr_mentions(const common::ObString &text, const common::ObString &name)
+{
+  bool found = false;
+  if (text.empty() || name.empty()) {
+    // nothing to compare against
+  } else {
+    for (int64_t i = 0; !found && i + name.length() <= text.length(); ++i) {
+      if (0 == name.case_compare(common::ObString(name.length(), text.ptr() + i))) {
+        const bool left_ok = (0 == i) || !is_ai_word_char(text.ptr()[i - 1]);
+        const int64_t after = i + name.length();
+        const bool right_ok = (after >= text.length()) || !is_ai_word_char(text.ptr()[after]);
+        bool in_literal = false;
+        for (int64_t k = 0; k < i; ++k) {
+          if ('\'' == text.ptr()[k] || '"' == text.ptr()[k]) {
+            in_literal = !in_literal;
+          }
+        }
+        found = left_ok && right_ok && !in_literal;
+      }
+    }
+  }
+  return found;
+}
+
+// AI COLUMN (2026 competition): the answer cached in an async AI column stops being valid when
+// the statement assigns a column its expression reads, or moves the row key. That invalidation
+// has to ride on the *same* row write: the storage concurrent control rejects a second
+// DF_UPDATE of one row inside a single transaction (OB_ERR_DEFENSIVE_CHECK), so no follow up
+// statement can clear the column and only the plan itself can.
+int check_ai_column_need_invalidate(const share::schema::ObTableSchema &table_schema,
+                                    const share::schema::ObColumnSchemaV2 &column,
+                                    const common::ObIArray<ObAssignment> &assigns,
+                                    bool &need_invalidate)
+{
+  int ret = OB_SUCCESS;
+  need_invalidate = false;
+  const share::schema::ObColumnSchemaV2 *req_col = NULL;
+  const common::ObString col_name = column.get_column_name_str();
+  static const char REQ_PREFIX[] = "__ai_request_";
+  const int64_t prefix_len = static_cast<int64_t>(sizeof(REQ_PREFIX)) - 1;
+  // The AI spec lives in the companion request column's comment. Column flags set while
+  // resolving a CREATE TABLE do not survive into the stored schema (they read back as 0), and
+  // hidden columns are not addressable by name, so the companion has to be found by walking
+  // the column array.
+  for (share::schema::ObTableSchema::const_column_iterator it = table_schema.column_begin();
+       it != table_schema.column_end() && NULL == req_col; ++it) {
+    const share::schema::ObColumnSchemaV2 *candidate = *it;
+    if (OB_NOT_NULL(candidate)
+        && candidate->get_column_name_str().length() == col_name.length() + prefix_len
+        && candidate->get_column_name_str().prefix_match(
+               common::ObString(static_cast<int32_t>(prefix_len), REQ_PREFIX))
+        && 0 == col_name.case_compare(common::ObString(
+               static_cast<int32_t>(candidate->get_column_name_str().length() - prefix_len),
+               candidate->get_column_name_str().ptr() + prefix_len))) {
+      req_col = candidate;
+    }
+  }
+  {
+    if (NULL == req_col) {
+      // not a column produced by an AI model
+    } else {
+      const common::ObString comment = req_col->get_comment_str();
+      static const char ASYNC_MARK[] = "sync_mode=async";
+      static const char EXPR_MARK[] = "normalized_expr=";
+      const char *async_pos = NULL;
+      const char *expr_pos = NULL;
+      for (int64_t i = 0; i + static_cast<int64_t>(sizeof(ASYNC_MARK)) - 1 <= comment.length(); ++i) {
+        if (0 == memcmp(comment.ptr() + i, ASYNC_MARK, sizeof(ASYNC_MARK) - 1)) {
+          async_pos = comment.ptr() + i;
+          break;
+        }
+      }
+      for (int64_t i = 0; i + static_cast<int64_t>(sizeof(EXPR_MARK)) - 1 <= comment.length(); ++i) {
+        if (0 == memcmp(comment.ptr() + i, EXPR_MARK, sizeof(EXPR_MARK) - 1)) {
+          expr_pos = comment.ptr() + i + sizeof(EXPR_MARK) - 1;
+          break;
+        }
+      }
+      if (NULL == async_pos || NULL == expr_pos) {
+        // a synchronous AI column is answered inline, its expression already recomputes it
+      } else {
+        const common::ObString expr_text(
+            static_cast<int32_t>(comment.length() - (expr_pos - comment.ptr())), expr_pos);
+        for (int64_t i = 0; OB_SUCC(ret) && !need_invalidate && i < assigns.count(); ++i) {
+          const ObColumnRefRawExpr *assigned_col = assigns.at(i).column_expr_;
+          const share::schema::ObColumnSchemaV2 *assigned_schema = NULL;
+          if (OB_ISNULL(assigned_col)) {
+            ret = OB_ERR_UNEXPECTED;
+            SQL_RESV_LOG(WARN, "empty ai assignment target", K(ret));
+          } else if (FALSE_IT(assigned_schema = table_schema.get_column_schema(
+                                         assigned_col->get_column_id()))) {
+            // resolve the schema of the assigned column
+          } else if (NULL == assigned_schema) {
+            // the assigned column does not belong to this table
+          } else if (assigned_schema->get_column_id() == column.get_column_id()) {
+            // the statement assigns the AI column itself, that value wins
+          } else if (assigned_schema->is_rowkey_column()) {
+            // the row moved to a new key, its answer has to be regenerated under that key
+            need_invalidate = true;
+          } else if (ai_expr_mentions(expr_text, assigned_schema->get_column_name_str())) {
+            need_invalidate = true;
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+} // namespace
+
 
 int ObTableAssignment::expand_expr(ObRawExprFactory &expr_factory,
                                    const ObIArray<ObAssignment> &assigns,
@@ -523,6 +644,7 @@ int ObDelUpdResolver::resolve_additional_assignments(ObIArray<ObTableAssignment>
         ColumnItem *col_item = NULL;
         ObColumnSchemaV2 *column_schema = *iter;
         bool need_assigned = false;
+        bool ai_invalidate = false;
         uint64_t column_id = OB_INVALID_ID;
         if (NULL == column_schema) {
           ret = OB_ERR_UNEXPECTED;
@@ -538,6 +660,12 @@ int ObDelUpdResolver::resolve_additional_assignments(ObIArray<ObTableAssignment>
                                             ((column_schema->is_vec_hnsw_vid_column() ||
                                               column_schema->is_vec_ivf_center_id_column()) && 
                                              (update_with_vector_index || T_INSERT_SCOPE == scope)))) {
+        } else if (T_UPDATE_SCOPE == scope
+                   && OB_FAIL(check_ai_column_need_invalidate(*table_schema, *column_schema,
+                                                               assigns.at(i).assignments_,
+                                                               ai_invalidate))) {
+          SQL_RESV_LOG(WARN, "fail to check whether the ai column must be invalidated", K(ret));
+        } else if (FALSE_IT(need_assigned = need_assigned || ai_invalidate)) {
         } else if (need_assigned) {
           // for insert scope, on duplicate key update column list already
           // exists in insert list, therefore, only need to add assignment.
@@ -562,6 +690,12 @@ int ObDelUpdResolver::resolve_additional_assignments(ObIArray<ObTableAssignment>
               if (OB_FAIL(copy_schema_expr(*params_.expr_factory_,
                                            col_item->expr_->get_dependant_expr(),
                                            assignment.expr_))) {
+              }
+            } else if (ai_invalidate) {
+              // drop the cached answer as part of this very row write
+              if (OB_FAIL(ObRawExprUtils::build_null_expr(*params_.expr_factory_,
+                                                          assignment.expr_))) {
+                SQL_RESV_LOG(WARN, "fail to build the ai invalidation value", K(ret));
               }
             } else if (trigger_exist) {
               assignment.expr_ = col_item->expr_;
@@ -699,6 +833,7 @@ int ObDelUpdResolver::add_assignment(common::ObIArray<ObTableAssignment> &assign
   }
   return ret;
 }
+
 
 int ObDelUpdResolver::check_need_assignment(const common::ObIArray<ObAssignment> &assigns,
                                             uint64_t table_id,

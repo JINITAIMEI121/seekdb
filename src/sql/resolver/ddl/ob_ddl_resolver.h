@@ -595,7 +595,7 @@ protected:
                                      common::ObString &name);
   static int build_ai_column_spec_comment(common::ObIAllocator &alloc,
                                           const AiColumnSpec &spec,
-                                          const bool is_json_result,
+                                          const common::ObObjType result_type,
                                           common::ObString &comment);
   // kind: 0 = state, 1 = request (carries @comment), 2 = result spec.
   static int build_ai_companion_column(const common::ObString &name,

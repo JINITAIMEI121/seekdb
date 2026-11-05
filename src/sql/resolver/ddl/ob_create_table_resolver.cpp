@@ -114,12 +114,11 @@ int ObCreateTableResolver::add_ai_column_companions(share::schema::ObTableSchema
     const AiColumnSpec &spec = specs.at(i);
     const ObColumnSchemaV2 *result = table_schema.get_column_schema(spec.column_id_);
     ObString comment;
-    bool is_json_result = false;
     if (OB_ISNULL(result)) {
       ret = OB_ERR_UNEXPECTED;
       SQL_RESV_LOG(WARN, "ai column result column is missing", K(ret), K(spec));
-    } else if (FALSE_IT(is_json_result = (ObJsonType == result->get_data_type()))) {
-    } else if (OB_FAIL(build_ai_column_spec_comment(*allocator_, spec, is_json_result, comment))) {
+    } else if (OB_FAIL(build_ai_column_spec_comment(*allocator_, spec, result->get_data_type(),
+                                                    comment))) {
       SQL_RESV_LOG(WARN, "fail to build ai column spec comment", K(ret), K(spec));
     }
     for (int64_t k = 0; OB_SUCC(ret) && k < 3; ++k) {
